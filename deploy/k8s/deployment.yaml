@@ -46,15 +46,40 @@ spec:
             # --- Performance ---
             - name: CARTESIA_STREAM_POOL_SIZE
               value: "4"
+            - name: CARTESIA_WS_FORCE_IPV4
+              value: "true"
             - name: THREAD_POOL_WORKERS
               value: "32"
             - name: BLOB_CACHE_BYTES
               value: "134217728"
-            # --- Predictive warming/stitching ---
+            - name: BULK_CREATE_MAX
+              value: "1000"
+            # --- Predictive warming ---
             - name: PREDICTIVE_WARM_ENABLED
               value: "true"
+            - name: PREDICTIVE_WARM_THRESHOLD
+              value: "5"
+            - name: PREDICTIVE_WARM_THRESHOLD_STEP
+              value: "1"
+            - name: PREDICTIVE_WARM_THRESHOLD_FLOOR
+              value: "2"
+            - name: PREDICTIVE_WARM_MIN_WORDS
+              value: "1"
+            - name: PREDICTIVE_WARM_MAX_WORDS
+              value: "12"
+            - name: PREDICTIVE_WARM_DECAY_FACTOR
+              value: "0.9"
+            - name: PREDICTIVE_WARM_DECAY_INTERVAL_S
+              value: "60"
+            - name: PREDICTIVE_WARM_MIN_FLOOR
+              value: "0.5"
+            # --- Predictive stitching ---
             - name: PREDICTIVE_STITCH_ENABLED
               value: "true"
+            - name: PREDICTIVE_STITCH_STREAM_ENABLED
+              value: "true"
+            - name: PREDICTIVE_STITCH_MIN_COVERAGE
+              value: "0.5"
             # --- Provider credentials ---
             - name: CARTESIA_API_KEY
               value: ""
