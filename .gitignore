@@ -26,8 +26,11 @@ Thumbs.db
 # Claude
 .claude/settings.local.json
 
-# Cache artifacts (audio)
+# DragonTTS runtime storage (SQLite db + audio blobs)
+data/
+*.db
+
+# Audio artifacts
 *.wav
 *.mp3
 *.ogg
-cache/
