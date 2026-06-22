@@ -149,3 +149,58 @@ async def test_stitch_skipped_when_coverage_below_gate(svc, fake_provider, monke
     audio, h = await svc.get_or_synthesize(_req_text("hi big unknown phrase here"))
     assert h["X-Cache"] == "MISS"  # full synth, not stitched (coverage 1/5 < 0.5)
 
+
+async def test_stream_serves_miss_stitch_then_hit(svc, fake_provider, monkeypatch):
+    """Streaming MISS is stitched from cached sub-phrases, stored, then re-served
+    as a HIT — so warmed sub-phrases aren't dead weight on /tts/stream."""
+    monkeypatch.setattr(settings, "predictive_stitch_enabled", True)
+    monkeypatch.setattr(settings, "predictive_stitch_stream_enabled", True)
+    for w in ("hi", "sir"):
+        await svc.create(_req_text(w))
+    seed_calls = fake_provider.calls
+
+    headers, gen = await svc.stream(_req_text("hi nitya sir"))
+    assert headers["X-Cache"] == "MISS-STITCH"
+    chunks = [c async for c in gen]
+    assert len(b"".join(chunks)) > 0
+    assert fake_provider.calls == seed_calls + 1  # only the gap "nitya" synthesized
+
+    # The assembled clip was stored -> a repeat is an instant HIT.
+    h2, _gen2 = await svc.stream(_req_text("hi nitya sir"))
+    assert h2["X-Cache"] == "HIT"
+    assert fake_provider.calls == seed_calls + 1  # no further synth
+
+
+def test_stitch_clips_removes_dc_and_silence():
+    """Single-clip path: DC offset removed and edge silence trimmed."""
+    import numpy as np
+    from app.cache.service import _stitch_clips, _to_int16, _to_float
+
+    sr = 16_000
+    tone = 0.4 * np.sin(2 * np.pi * 200 * np.arange(sr // 2) / sr) + 0.3  # + DC bias
+    padded = np.concatenate(
+        [np.zeros(sr // 4), tone, np.zeros(sr // 4)]
+    ).astype(np.float32)
+    out = _to_float(_stitch_clips([_to_int16(padded)]))
+    assert len(out) < len(padded) - sr // 4          # leading/trailing silence gone
+    assert abs(float(np.mean(out))) < 0.02           # DC removed
+
+
+def test_stitch_clips_equalizes_loudness():
+    """A quiet clip and a loud clip come out at comparable loudness."""
+    import numpy as np
+    from app.cache.service import _stitch_clips, _to_int16, _to_float
+
+    sr = 16_000
+    t = np.arange(sr // 2) / sr
+    quiet = (0.05 * np.sin(2 * np.pi * 200 * t)).astype(np.float32)  # RMS ~0.035
+    loud = (0.6 * np.sin(2 * np.pi * 300 * t)).astype(np.float32)    # RMS ~0.42
+    raw = _stitch_clips([_to_int16(quiet), _to_int16(loud)])
+    assert len(raw) % 2 == 0 and len(raw) > 0   # valid int16 byte stream
+    out = _to_float(raw)
+    half = len(out) // 2
+    r_quiet = float(np.sqrt(np.mean(out[:half] ** 2)))
+    r_loud = float(np.sqrt(np.mean(out[half : half * 2] ** 2)))
+    assert r_quiet > 0.05                            # quiet clip was amplified up
+    assert max(r_quiet, r_loud) / max(1e-6, min(r_quiet, r_loud)) < 4.0  # roughly matched
+

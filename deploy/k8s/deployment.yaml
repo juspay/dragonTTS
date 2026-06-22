@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dragontts
+  namespace: beta
+  labels:
+    app: dragontts
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: dragontts
+  template:
+    metadata:
+      labels:
+        app: dragontts
+    spec:
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+      nodeSelector:
+        cloud.google.com/gke-nodepool: beta-pool
+      containers:
+        - name: dragontts
+          image: asia-south1-docker.pkg.dev/breeze-automatic-prod/dragontts/dragontts:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            # --- Storage ---
+            - name: DB_PATH
+              value: "/app/data/dragontts.db"
+            - name: BLOB_DIR
+              value: "/app/data/blobs"
+            # --- Cache policy ---
+            - name: MAX_CACHE_BYTES
+              value: "0"
+            - name: TTL_SECONDS
+              value: "0"
+            - name: ENABLE_WRITE_THROUGH
+              value: "true"
+            # --- Performance ---
+            - name: CARTESIA_STREAM_POOL_SIZE
+              value: "4"
+            - name: THREAD_POOL_WORKERS
+              value: "32"
+            - name: BLOB_CACHE_BYTES
+              value: "134217728"
+            # --- Predictive warming/stitching ---
+            - name: PREDICTIVE_WARM_ENABLED
+              value: "true"
+            - name: PREDICTIVE_STITCH_ENABLED
+              value: "true"
+            # --- Provider credentials ---
+            - name: CARTESIA_API_KEY
+              value: ""
+            - name: SARVAM_API_KEY
+              value: ""
+            - name: ELEVENLABS_API_KEY
+              value: ""
+            - name: ELEVENLABS_BASE_URL
+              value: "https://api.elevenlabs.io"
+            - name: ELEVENLABS_INDIAN_RESIDENCY_API_KEY
+              value: ""
+            - name: ELEVENLABS_INDIAN_RESIDENCY_BASE_URL
+              value: ""
+            - name: GOOGLE_CREDENTIALS_JSON
+              value: ""
+            - name: GOOGLE_CREDENTIALS_PATH
+              value: ""
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+              subPath: data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 1000m
+              memory: 900Mi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: 1000m
+              memory: 1300Mi
+              ephemeral-storage: 2Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: dragontts-data

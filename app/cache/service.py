@@ -16,6 +16,8 @@ cache snapshot is served from incrementally-maintained totals.
 from __future__ import annotations
 
 import asyncio
+
+import numpy as np
 from collections import defaultdict
 from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta, timezone
@@ -53,29 +55,113 @@ async def _chunked(data: bytes, size: int = _STREAM_CHUNK) -> AsyncGenerator[byt
         yield data[i : i + size]
 
 
-def _crossfade_concat(pieces: list[bytes], overlap_samples: int = 240) -> bytes:
-    """Concatenate native pcm_s16le pieces with a short linear cross-fade at each
-    seam (~15ms @16k) to avoid clicks. Pieces too short for the overlap are
-    butted directly."""
+# --- stitch assembly DSP (numpy) ------------------------------------------
+# Assembles native pcm_s16le@16k mono sub-phrase clips into one continuous clip.
+# Choppiness in stitched TTS comes from three cheap-to-fix things — not pitch:
+#   1. clicks/pops  -> DC-offset removal + splice at a zero crossing
+#   2. doubled silence -> edge silence-trim (with a guard so onsets survive)
+#   3. loudness mismatch -> per-clip RMS normalization to a common target
+# plus an equal-power (constant-power) crossfade so the seam doesn't dip.
+# Pure numpy: no heavy voice deps, and this is also the audioop->Py3.13 path.
+
+_SR = 16_000              # native sample rate (pcm_s16le@16k)
+_XFADE_MS = 15.0          # equal-power crossfade overlap (~15ms; 10-25ms is the sweet spot)
+_TARGET_RMS_DB = -20.0    # per-clip loudness target (speech sits ~-23..-18 dBFS RMS)
+_RMS_FLOOR_DB = -55.0     # below this a clip is near-silent (breath/gap): don't amplify
+_SIL_THRESH = 0.012       # ~1% full-scale; windowed RMS below this = silence
+_SIL_GUARD_MS = 6.0       # guard kept at each trimmed edge so word onsets/offsets survive
+_ZC_SEARCH_MS = 4.0       # window scanned for a zero crossing to anchor the splice
+
+
+def _to_float(b: bytes) -> np.ndarray:
+    """int16 LE pcm bytes -> float32 in [-1, 1]."""
+    return np.frombuffer(b, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def _to_int16(x: np.ndarray) -> bytes:
+    """float32 [-1, 1] -> int16 LE pcm bytes."""
+    return (np.clip(x, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+
+
+def _rms_normalize(x: np.ndarray) -> np.ndarray:
+    """Scale so the clip's RMS hits the target loudness; leave near-silent clips."""
+    rms = float(np.sqrt(np.mean(x * x))) + 1e-12
+    db = 20.0 * np.log10(rms)
+    if db < _RMS_FLOOR_DB:
+        return x
+    return x * (10.0 ** ((_TARGET_RMS_DB - db) / 20.0))
+
+
+def _trim_edges(x: np.ndarray, head: bool, tail: bool) -> np.ndarray:
+    """Trim leading/trailing near-silent samples (windowed RMS), keeping a guard."""
+    n = len(x)
+    if n == 0:
+        return x
+    win = max(1, int(_SR * 1.0 / 1000))  # 1ms RMS window
+    energy = np.convolve(x * x, np.ones(win, dtype=np.float32) / win, mode="same")
+    loud = energy > _SIL_THRESH * _SIL_THRESH
+    if not loud.any():
+        return x  # all-silent (e.g. test fixtures): leave untouched
+    first = int(np.argmax(loud))
+    last = n - int(np.argmax(loud[::-1]))
+    guard = int(_SR * _SIL_GUARD_MS / 1000)
+    start = max(0, first - guard) if head else 0
+    end = min(n, last + guard) if tail else n
+    if start >= end:
+        return x
+    return x[start:end]
+
+
+def _snap_zero(x: np.ndarray, side: str) -> int:
+    """Index near the head/tail edge where the signal crosses zero (minimizes the
+    step discontinuity at the splice). Falls back to the raw edge if none nearby."""
+    span = min(int(_SR * _ZC_SEARCH_MS / 1000), len(x))
+    if span < 2:
+        return 0 if side == "head" else len(x)
+    if side == "head":
+        seg = x[:span]
+        zc = np.where(np.diff(np.signbit(seg)))[0]
+        return int(zc[0]) if zc.size else 0
+    seg = x[-span:]
+    zc = np.where(np.diff(np.signbit(seg)))[0]
+    return (len(x) - span + int(zc[-1] + 1)) if zc.size else len(x)
+
+
+def _equal_power_xfade(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Overlap a's tail with b's head via a constant-power (cos/sin) crossfade.
+    cos^2+sin^2=1 keeps total power constant through the fade, avoiding the -3dB
+    midpoint dip a linear fade produces on uncorrelated speech."""
+    n = min(int(_SR * _XFADE_MS / 1000), len(a), len(b))
+    if n <= 0:
+        return np.concatenate([a, b])
+    t = np.linspace(0.0, np.pi / 2.0, n, dtype=np.float32)  # 0 -> pi/2
+    blended = a[-n:] * np.cos(t) + b[:n] * np.sin(t)
+    return np.concatenate([a[:-n], blended, b[n:]])
+
+
+def _stitch_clips(pieces: list[bytes]) -> bytes:
+    """Assemble native pcm_s16le@16k clips into one continuous clip.
+
+    Per clip: DC-remove -> silence-trim -> RMS-normalize; then splice each pair
+    at zero crossings with an equal-power crossfade. Returns native int16 bytes.
+    """
     if not pieces:
         return b""
-    out = bytearray(pieces[0])
-    ob = overlap_samples * 2  # bytes (16-bit mono)
-    for p in pieces[1:]:
-        if len(out) >= ob and len(p) >= ob:
-            tail = out[-ob:]
-            head = p[:ob]
-            blended = bytearray(ob)
-            for i in range(overlap_samples):
-                ta = int.from_bytes(tail[2 * i : 2 * i + 2], "little", signed=True)
-                ha = int.from_bytes(head[2 * i : 2 * i + 2], "little", signed=True)
-                w = (i + 1) / (overlap_samples + 1)  # 0→1 across the overlap
-                v = int(ta * (1 - w) + ha * w)
-                blended[2 * i : 2 * i + 2] = v.to_bytes(2, "little", signed=True)
-            out = out[:-ob] + blended + p[ob:]
-        else:
-            out += p
-    return bytes(out)
+    clips: list[np.ndarray] = []
+    for p in pieces:
+        x = _to_float(p)
+        x = _trim_edges(x, head=True, tail=True)  # trim silence on the raw signal first
+        x = x - float(np.mean(x))                  # DC removal over the voiced part
+        x = _rms_normalize(x)
+        clips.append(x)
+    if len(clips) == 1:
+        return _to_int16(clips[0])
+    out = clips[0]
+    for nxt in clips[1:]:
+        out = out[: _snap_zero(out, "tail")]
+        nxt = nxt[_snap_zero(nxt, "head"):]
+        out = _equal_power_xfade(out, nxt)
+    return _to_int16(out)
 
 
 def _same_format(encoding_a: str, rate_a: int, encoding_b: str, rate_b: int) -> bool:
@@ -253,7 +339,7 @@ class CacheService:
             f"STITCH key=… provider={provider} words={len(words)} "
             f"spans={len(spans)} coverage={cached_words}/{len(words)}"
         )
-        return _crossfade_concat(pieces)
+        return _stitch_clips(pieces)
 
     async def get_or_synthesize(self, req: TTSRequest) -> tuple[bytes, dict]:
         provider, model, of, params_canon, key = self._resolve(req)
@@ -368,6 +454,37 @@ class CacheService:
         logger.info(
             f"CACHE MISS (stream) key={key[:12]}… provider={provider} — streaming synth"
         )
+
+        # Predictive stitch: assemble from cached sub-phrases + synthesized gaps,
+        # store the assembled clip, and stream it chunked (so future requests HIT).
+        # Falls through to live streaming if not worthwhile. Unlike live streaming
+        # this waits for the gaps to synth before first byte — but the assembled
+        # clip is then cached, so repeats are instant HITs.
+        if settings.predictive_stitch_stream_enabled:
+            stitched = await self.stitch(req, provider, model, params_canon)
+            if stitched is not None:
+                if settings.enable_write_through:
+                    await self._store(
+                        key, req, provider, model, params_canon,
+                        stitched, "pcm_s16le", 16000, existing=record,
+                    )
+                audio = convert_audio(
+                    stitched,
+                    native_encoding="pcm_s16le",
+                    native_rate=16000,
+                    out_encoding=of.encoding,
+                    out_rate=of.sample_rate,
+                )
+                await self._metadata.record_metrics(
+                    requests=1, misses=1, bytes_served=len(audio), synth_calls=1
+                )
+                self._misses += 1
+                logger.info(
+                    f"CACHE MISS-STITCH (stream) key={key[:12]}… "
+                    f"provider={provider} size={len(audio)}B"
+                )
+                return {"X-Cache": "MISS-STITCH", "X-Cache-Key": key}, _chunked(audio)
+
         instance = self._get_provider(provider)
         if instance is None:
             raise ProviderNotConfigured(provider)

@@ -111,6 +111,11 @@ class Settings(BaseSettings):
     # gaps, cross-fade at seams. Skipped below the coverage gate.
     predictive_stitch_enabled: bool = True
     predictive_stitch_min_coverage: float = 0.5  # min cached fraction to stitch
+    # Apply stitch on the /tts/stream path too (assemble + stream + cache).
+    # Independent of the one-shot flag: live streaming has lower TTFB, so this is
+    # the trade of "first request waits for gap-synth + assembly" vs "reuse cached
+    # sub-phrases and cache the assembled clip for instant repeat HITs".
+    predictive_stitch_stream_enabled: bool = True
 
     @property
     def configured_providers(self) -> list[str]:
