@@ -23,6 +23,7 @@ from fastapi.responses import StreamingResponse
 
 from app.audio.format import content_type_for
 from app.cache.key import parse_model_id
+from app.cache.resilience import ProviderBusy
 from app.core.config import settings
 from app.providers.base import ProviderError
 from app.providers.registry import ProviderNotConfigured
@@ -51,6 +52,12 @@ async def tts_bytes(req: TTSRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
     except ProviderNotConfigured as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except ProviderBusy as e:
+        raise HTTPException(status_code=503, detail=str(e), headers={"Retry-After": "1"})
+    except ProviderError as e:
+        raise HTTPException(
+            status_code=502, detail=f"upstream {provider} returned an error: {e}"
+        )
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         raise _map_upstream_error(provider, e)
 
@@ -79,11 +86,20 @@ async def tts_stream(req: TTSRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
     except ProviderNotConfigured as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except ProviderBusy as e:
+        raise HTTPException(status_code=503, detail=str(e), headers={"Retry-After": "1"})
+    except ProviderError as e:
+        raise HTTPException(
+            status_code=502, detail=f"upstream {provider} returned an error: {e}"
+        )
 
     try:
         first = await gen.__anext__()
     except StopAsyncIteration:
         first = b""
+    except ProviderBusy as e:
+        await gen.aclose()
+        raise HTTPException(status_code=503, detail=str(e), headers={"Retry-After": "1"})
     except (ProviderError, httpx.HTTPStatusError, httpx.RequestError, OSError) as e:
         await gen.aclose()
         raise _map_upstream_error(provider, e)
@@ -147,6 +163,12 @@ async def tts_create(req: TTSRequest, request: Request):
         key, status, source, size, _, model, enc, rate = await cache.create(req, audio_override)
     except ProviderNotConfigured as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except ProviderBusy as e:
+        raise HTTPException(status_code=503, detail=str(e), headers={"Retry-After": "1"})
+    except ProviderError as e:
+        raise HTTPException(
+            status_code=502, detail=f"upstream {provider} returned an error: {e}"
+        )
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         raise _map_upstream_error(provider, e)
 
@@ -210,6 +232,10 @@ async def tts_create_bulk(requests: list[TTSRequest], request: Request):
             errors.append({"index": i, "error": str(e)})
         except ProviderNotConfigured as e:
             errors.append({"index": i, "error": str(e)})
+        except ProviderBusy:
+            errors.append({"index": i, "error": "provider busy (bulkhead full); retry"})
+        except ProviderError as e:
+            errors.append({"index": i, "error": f"upstream error: {e}"})
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
             errors.append({"index": i, "error": f"upstream error: {type(e).__name__}"})
     return {

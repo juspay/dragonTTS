@@ -23,8 +23,8 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Claude
-.claude/settings.local.json
+# Claude (local tooling state — never commit)
+.claude/
 
 # DragonTTS runtime storage (SQLite db + audio blobs)
 data/

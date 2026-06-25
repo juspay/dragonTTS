@@ -1,0 +1,116 @@
+"""Write-behind metrics: defer the stats-only HIT writes off the read path.
+
+A cache HIT currently awaits a SQLite ``touch_and_record`` (a WAL commit) before
+returning audio. This batches those updates — per-key touch sums + summed metric
+deltas — and flushes them on an interval, a batch threshold, or shutdown, so a HIT
+returns audio without waiting on the DB writer.
+
+Stats-only: a crash can lose at most one flush-window of *counters* (never wrong
+audio — the cache row itself is unchanged, and the correctness-critical writes
+``put`` / ``put_with_totals`` / ``delete`` / ``adjust_totals`` stay synchronous on
+the metadata store).
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+from app.core.logging import logger
+
+
+class WriteBehindMetrics:
+    """Batch + defer ``touch_and_record`` and ``record_metrics`` behind the read path."""
+
+    def __init__(self, metadata, flush_interval_s: float, flush_batch: int):
+        self._meta = metadata
+        self._flush_interval = flush_interval_s
+        self._flush_batch = max(1, flush_batch)
+        self._touches: dict[str, dict[str, int]] = {}
+        self._counters: dict[str, int] = {}
+        self._lock = asyncio.Lock()
+        self._pending = 0
+        self._task: asyncio.Task | None = None
+        self._stopped = False
+        # Strong refs to threshold-spawned flush tasks so the GC can't collect
+        # them mid-flight (an unreferenced task may be cancelled before it runs).
+        self._flush_tasks: set[asyncio.Task] = set()
+
+    def start(self) -> None:
+        if self._task is None and not self._stopped:
+            self._task = asyncio.create_task(self._run())
+
+    def _spawn_flush(self) -> None:
+        """Schedule a flush now (batch threshold crossed), keeping a strong ref."""
+        task = asyncio.create_task(self._flush())
+        self._flush_tasks.add(task)
+        task.add_done_callback(self._flush_tasks.discard)
+
+    async def stop(self) -> None:
+        self._stopped = True
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # Cancel any threshold-spawned flushes (redundant with the final drain).
+        for t in list(self._flush_tasks):
+            t.cancel()
+        self._flush_tasks.clear()
+        await self._flush()  # final drain so graceful shutdown loses nothing
+
+    async def touch_and_record(self, key: str, deltas: dict) -> None:
+        async with self._lock:
+            d = self._touches.setdefault(key, {})
+            for k, v in deltas.items():
+                d[k] = d.get(k, 0) + int(v)
+            self._pending += 1
+            hot = self._pending >= self._flush_batch
+        if hot:
+            self._spawn_flush()  # batch threshold -> flush promptly
+
+    async def record_metrics(self, **deltas: int) -> None:
+        async with self._lock:
+            for k, v in deltas.items():
+                self._counters[k] = self._counters.get(k, 0) + int(v)
+            self._pending += 1
+            hot = self._pending >= self._flush_batch
+        if hot:
+            self._spawn_flush()
+
+    async def _flush(self) -> None:
+        # Swap the accumulators out under the lock, then write without holding it
+        # (so a slow flush doesn't block accumulation). Concurrent flushes are safe
+        # — the later one swaps empty dicts and no-ops.
+        async with self._lock:
+            if not self._touches and not self._counters:
+                self._pending = 0
+                return
+            touches, self._touches = self._touches, {}
+            counters, self._counters = self._counters, {}
+            self._pending = 0
+        for key, d in touches.items():
+            try:
+                # The store's touch_and_record bumps hit_count by the ``hits``
+                # delta (default 1) and sums all deltas into the daily rollup, so
+                # one batched call == N synchronous calls exactly.
+                await self._meta.touch_and_record(key, d)
+            except Exception as e:
+                logger.warning(f"write-behind touch flush failed ({key[:8]}…): {e}")
+        if counters:
+            try:
+                await self._meta.record_metrics(**counters)
+            except Exception as e:
+                logger.warning(f"write-behind metrics flush failed: {e}")
+
+    async def _run(self) -> None:
+        while not self._stopped:
+            try:
+                await asyncio.sleep(self._flush_interval)
+                await self._flush()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"write-behind flush loop error: {e}")
+                await asyncio.sleep(self._flush_interval)

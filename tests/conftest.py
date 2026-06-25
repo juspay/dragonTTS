@@ -9,6 +9,27 @@ from app.core.config import settings
 from app.providers.base import AudioResult, BaseTTSProvider
 
 
+@pytest.fixture(autouse=True)
+def _reset_resilience_gates():
+    """Resilience gates are cached module-level; reset per test for loop isolation."""
+    from app.cache.resilience import reset_gates
+
+    reset_gates()
+    yield
+    reset_gates()
+
+
+@pytest.fixture(autouse=True)
+def _sync_metrics_in_tests(monkeypatch):
+    """Use synchronous metrics writes in tests so hit_count/metric assertions hold.
+
+    Write-behind defers touch_and_record + record_metrics; tests that assert on
+    hit_count or the daily metrics row need those writes applied immediately, so
+    force the synchronous path. Dedicated write-behind tests opt back in locally.
+    """
+    monkeypatch.setattr(settings, "metrics_write_behind_enabled", False)
+
+
 class FakeProvider(BaseTTSProvider):
     """Deterministic in-process provider — no network. Returns raw 16kHz PCM."""
 
@@ -62,9 +83,23 @@ def pcm_request() -> dict:
 
 
 @pytest.fixture
-def app_client(tmp_storage):
-    """FastAPI TestClient with a FakeProvider injected under the 'cartesia' route."""
+def app_client(tmp_storage, monkeypatch):
+    """Hermetic FastAPI TestClient with a FakeProvider under the 'cartesia' route.
+
+    Real provider keys are cleared so the startup registry builds NO live
+    providers — the only configured provider is the injected FakeProvider, and
+    no test hits a real provider API regardless of what's in .env.
+    """
     from app.main import app
+
+    for attr in (
+        "cartesia_api_key",
+        "sarvam_api_key",
+        "elevenlabs_indian_residency_api_key",
+        "google_credentials_json",
+        "google_credentials_path",
+    ):
+        monkeypatch.setattr(settings, attr, "")
 
     with TestClient(app) as client:
         fake = FakeProvider()

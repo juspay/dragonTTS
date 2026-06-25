@@ -18,12 +18,13 @@ from __future__ import annotations
 import asyncio
 
 import numpy as np
-from collections import defaultdict
 from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from app.audio.format import convert_audio
+from app.cache.metrics import WriteBehindMetrics
+from app.cache.resilience import get_gate
 from app.cache.key import (
     canonical_params,
     hash_key,
@@ -33,7 +34,7 @@ from app.cache.key import (
 from app.cache.segment import segment
 from app.core.config import settings
 from app.core.logging import logger
-from app.providers.base import AudioResult, BaseTTSProvider
+from app.providers.base import AudioResult, BaseTTSProvider, ProviderError
 from app.providers.registry import ProviderNotConfigured
 from app.schemas.tts import TTSRequest
 from app.storage.base import CacheRecord
@@ -178,15 +179,41 @@ class CacheService:
         self._metadata = metadata
         self._blobs = blobs
         self._get_provider = get_provider
+        # Write-behind wrapper for stats-only writes (HIT touch + metrics) so a HIT
+        # returns audio without awaiting a SQLite commit. Falls back to the raw
+        # store (synchronous) when disabled. Correctness-critical writes
+        # (put/put_with_totals/delete/adjust_totals) stay on self._metadata.
+        self._metrics = (
+            WriteBehindMetrics(
+                metadata,
+                settings.metrics_flush_interval_ms / 1000.0,
+                settings.metrics_flush_batch_size,
+            )
+            if settings.metrics_write_behind_enabled
+            else metadata
+        )
         # Ephemeral session counters (reset on restart); durable metrics are in the DB.
         self._hits = 0
         self._misses = 0
+        # Per-key in-flight synth futures for single-flight: N concurrent
+        # identical MISSes share ONE synth + ONE store. Loop-thread-only (no lock).
+        self._inflight: dict[str, asyncio.Future] = {}
         # Optional predictive-warmer observer (set via attach_tracker). Never
         # blocks or breaks reads; observation is fast and warming is async.
         self._tracker = None
 
     def attach_tracker(self, tracker) -> None:
         self._tracker = tracker
+
+    async def start(self) -> None:
+        """Start background tasks (write-behind metrics flusher)."""
+        if hasattr(self._metrics, "start"):
+            self._metrics.start()
+
+    async def stop(self) -> None:
+        """Flush + stop background tasks (graceful shutdown loses no metrics)."""
+        if hasattr(self._metrics, "stop"):
+            await self._metrics.stop()
 
     async def _observe(self, *, text, provider, voice_id, model, language, params) -> None:
         if self._tracker is None:
@@ -227,17 +254,23 @@ class CacheService:
         )
 
     async def _synthesize(self, req: TTSRequest, provider: str, model: str) -> AudioResult:
-        """Synthesize via the routed provider; return its NATIVE-format audio."""
+        """Synthesize via the routed provider; return its NATIVE-format audio.
+
+        Runs under the provider's resilience gate (bulkhead + rate limit) so a
+        slow/hung provider is capped and can't starve the others.
+        """
         instance = self._get_provider(provider)
         if instance is None:
             raise ProviderNotConfigured(provider)
-        return await instance.synth(
-            text=req.transcript,
-            voice_id=req.voice.id,
-            model=model,
-            language=req.language,
-            params=req.params,
-        )
+        gate = get_gate(provider)
+        async with gate:
+            return await instance.synth(
+                text=req.transcript,
+                voice_id=req.voice.id,
+                model=model,
+                language=req.language,
+                params=req.params,
+            )
 
     async def _store(
         self,
@@ -250,8 +283,15 @@ class CacheService:
         encoding: str,
         sample_rate: int,
         existing=_UNCHECKED,
+        replace: bool = False,
     ) -> None:
-        """Store ``audio`` (already in ``encoding``/``sample_rate``) as native."""
+        """Store ``audio`` (already in ``encoding``/``sample_rate``) as native.
+
+        Fresh misses (no existing row, ``replace=False``) use INSERT OR IGNORE so
+        concurrent identical misses can't double-count ``provider_totals``.
+        Existing rows (expired refresh) and explicit overrides (``replace=True``)
+        REPLACE the row and adjust totals by the size delta.
+        """
         if existing is _UNCHECKED:
             existing = await self._metadata.get(key)
         old_size = existing.size_bytes if existing else 0
@@ -262,28 +302,50 @@ class CacheService:
             if settings.ttl_seconds
             else None
         )
-        await self._metadata.put(
-            CacheRecord(
-                key=key,
-                provider=provider,
-                voice_id=req.voice.id,
-                model=model,
-                language=req.language,
-                params=params_canon,
-                text=req.transcript,
-                container="raw",
-                encoding=encoding,
-                sample_rate=sample_rate,
-                size_bytes=len(audio),
-                storage_path=storage_path,
-                hit_count=0,
-                created_at=now.isoformat(),
-                last_accessed_at=now.isoformat(),
-                ttl_expires_at=ttl,
-            )
+        record = CacheRecord(
+            key=key,
+            provider=provider,
+            voice_id=req.voice.id,
+            model=model,
+            language=req.language,
+            params=params_canon,
+            text=req.transcript,
+            container="raw",
+            encoding=encoding,
+            sample_rate=sample_rate,
+            size_bytes=len(audio),
+            storage_path=storage_path,
+            hit_count=0,
+            created_at=now.isoformat(),
+            last_accessed_at=now.isoformat(),
+            ttl_expires_at=ttl,
         )
-        # Keep the incrementally-maintained snapshot in sync (new vs override).
-        await self._metadata.adjust_totals(provider, 0 if existing else 1, len(audio) - old_size)
+        if existing is None and not replace:
+            # Fresh miss: INSERT OR IGNORE — race-free totals under concurrent
+            # identical misses (only the first store inserts + bumps totals).
+            await self._metadata.put_with_totals(record)
+        else:
+            # Existing row (refresh) or explicit override: REPLACE + size delta.
+            await self._metadata.put(record)
+            await self._metadata.adjust_totals(
+                provider, 0 if existing else 1, len(audio) - old_size
+            )
+
+    async def _convert_audio(
+        self, data: bytes, *, native_encoding: str, native_rate: int,
+        out_encoding: str, out_rate: int,
+    ) -> bytes:
+        """convert_audio off the event loop.
+
+        audioop resample/μ-law conversion is CPU-bound and runs on every serve
+        (HIT and MISS); inline it would block the loop (and starve the Cartesia
+        socket pumps) under concurrent load, so dispatch it to the worker pool.
+        """
+        return await asyncio.to_thread(
+            convert_audio, data,
+            native_encoding=native_encoding, native_rate=native_rate,
+            out_encoding=out_encoding, out_rate=out_rate,
+        )
 
     # -- read path -----------------------------------------------------------
 
@@ -339,7 +401,71 @@ class CacheService:
             f"STITCH key=… provider={provider} words={len(words)} "
             f"spans={len(spans)} coverage={cached_words}/{len(words)}"
         )
-        return _stitch_clips(pieces)
+        return await asyncio.to_thread(_stitch_clips, pieces)
+
+    async def _produce(
+        self, req: TTSRequest, provider: str, model: str, params_canon: str,
+        key: str, record,
+    ) -> tuple[bytes, str, int, str]:
+        """Synth + store for a MISS. Returns (native, encoding, rate, status)
+        where status is 'MISS', 'MISS-STITCH', or 'HIT' (if the cache was filled
+        between the outer lookup and here — e.g. by the warmer)."""
+        rec = await self._metadata.get(key)
+        if rec and not self._expired(rec):
+            return await self._blobs.get(rec.storage_path), rec.encoding, rec.sample_rate, "HIT"
+        stitched = await self.stitch(req, provider, model, params_canon)
+        if stitched is not None:
+            if settings.enable_write_through:
+                await self._store(
+                    key, req, provider, model, params_canon,
+                    stitched, "pcm_s16le", 16000, existing=record,
+                )
+            return stitched, "pcm_s16le", 16000, "MISS-STITCH"
+        native = await self._synthesize(req, provider, model)
+        if settings.enable_write_through:
+            await self._store(
+                key, req, provider, model, params_canon,
+                native.audio, native.encoding, native.sample_rate, existing=record,
+            )
+        return native.audio, native.encoding, native.sample_rate, "MISS"
+
+    async def _produce_native(
+        self, req: TTSRequest, provider: str, model: str, params_canon: str,
+        key: str, record,
+    ) -> tuple[bytes, str, int, str, bool]:
+        """Single-flight: produce + store native audio for ``key`` exactly once.
+
+        Concurrent MISSes for the same key share one synth + one store (the
+        producer's future). Returns (native, encoding, rate, status, produced):
+        ``produced`` is True for the caller that ran the synth (records a miss +
+        synth_call) and False for a caller that coalesced (records a hit — served
+        without its own Cartesia call).
+        """
+        fut = self._inflight.get(key)
+        if fut is not None:
+            native, enc, rate, status = await fut
+            return native, enc, rate, status, False  # coalesced — no own synth
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._inflight[key] = fut
+        try:
+            result = await self._produce(req, provider, model, params_canon, key, record)
+            if not fut.done():
+                fut.set_result(result)
+            native, enc, rate, status = result
+            # `produced` = a synth actually ran. _produce can short-circuit to
+            # status='HIT' (the warmer filled the key between the outer MISS
+            # lookup and the inner re-fetch) — that served a cache read, not a
+            # synth, so it must count as a HIT, not a miss/synth_call.
+            produced = status in ("MISS", "MISS-STITCH")
+            return native, enc, rate, status, produced
+        except BaseException as e:
+            if not fut.done():
+                fut.set_exception(e)
+            raise
+        finally:
+            if self._inflight.get(key) is fut:
+                self._inflight.pop(key, None)
 
     async def get_or_synthesize(self, req: TTSRequest) -> tuple[bytes, dict]:
         provider, model, of, params_canon, key = self._resolve(req)
@@ -351,14 +477,14 @@ class CacheService:
         record = await self._metadata.get(key)
         if record and not self._expired(record):
             native = await self._blobs.get(record.storage_path)
-            audio = convert_audio(
+            audio = await self._convert_audio(
                 native,
                 native_encoding=record.encoding,
                 native_rate=record.sample_rate,
                 out_encoding=of.encoding,
                 out_rate=of.sample_rate,
             )
-            await self._metadata.touch_and_record(
+            await self._metrics.touch_and_record(
                 key, {"requests": 1, "hits": 1, "bytes_served": len(audio)}
             )
             self._hits += 1
@@ -367,50 +493,36 @@ class CacheService:
 
         logger.info(f"CACHE MISS key={key[:12]}… provider={provider} — synthesizing")
 
-        # Predictive stitch: serve from cached sub-phrases + synth only the gaps.
-        # Returns None if disabled/not worthwhile -> fall through to full synth.
-        stitched = await self.stitch(req, provider, model, params_canon)
-        if stitched is not None:
-            # Persist the assembled clip as native pcm so re-requests HIT instead
-            # of re-synthesizing the gaps on every call.
-            if settings.enable_write_through:
-                await self._store(
-                    key, req, provider, model, params_canon,
-                    stitched, "pcm_s16le", 16000, existing=record,
-                )
-            audio = convert_audio(
-                stitched,
-                native_encoding="pcm_s16le",
-                native_rate=16000,
-                out_encoding=of.encoding,
-                out_rate=of.sample_rate,
-            )
-            await self._metadata.record_metrics(
-                requests=1, misses=1, bytes_served=len(audio), synth_calls=1
-            )
-            self._misses += 1
-            return audio, {"X-Cache": "MISS-STITCH", "X-Cache-Key": key}
-
-        native = await self._synthesize(req, provider, model)
-
-        if settings.enable_write_through:
-            await self._store(
-                key, req, provider, model, params_canon,
-                native.audio, native.encoding, native.sample_rate, existing=record,
-            )
-
-        audio = convert_audio(
-            native.audio,
-            native_encoding=native.encoding,
-            native_rate=native.sample_rate,
+        # Single-flight: N concurrent identical misses share one synth + one store.
+        native, nenc, nrate, status, produced = await self._produce_native(
+            req, provider, model, params_canon, key, record
+        )
+        audio = await self._convert_audio(
+            native,
+            native_encoding=nenc,
+            native_rate=nrate,
             out_encoding=of.encoding,
             out_rate=of.sample_rate,
         )
-        await self._metadata.record_metrics(
-            requests=1, misses=1, bytes_served=len(audio), synth_calls=1
-        )
-        self._misses += 1
-        return audio, {"X-Cache": "MISS", "X-Cache-Key": key}
+        if produced:
+            await self._metrics.record_metrics(
+                requests=1, misses=1, bytes_served=len(audio), synth_calls=1
+            )
+            self._misses += 1
+            logger.info(f"CACHE {status} key={key[:12]}… provider={provider}")
+        else:
+            # Served from cache without our own synth: either coalesced onto an
+            # in-flight producer, or _produce found the warmer had filled the key
+            # (status='HIT'). Count as a HIT AND bump hit_count/last_accessed —
+            # the normal HIT path does this via touch_and_record; the single-
+            # flight path must too, or LRU recency goes stale under warming.
+            await self._metrics.touch_and_record(
+                key, {"requests": 1, "hits": 1, "bytes_served": len(audio)}
+            )
+            self._hits += 1
+            status = "HIT"
+            logger.info(f"CACHE HIT (coalesced) key={key[:12]}… provider={provider}")
+        return audio, {"X-Cache": status, "X-Cache-Key": key}
 
     # -- streaming read path ------------------------------------------------
 
@@ -436,7 +548,7 @@ class CacheService:
             if _same_format(of.encoding, of.sample_rate, record.encoding, record.sample_rate):
                 served, chunks = native, _chunked(native)
             else:
-                served = convert_audio(
+                served = await self._convert_audio(
                     native,
                     native_encoding=record.encoding,
                     native_rate=record.sample_rate,
@@ -444,7 +556,7 @@ class CacheService:
                     out_rate=of.sample_rate,
                 )
                 chunks = _chunked(served)
-            await self._metadata.touch_and_record(
+            await self._metrics.touch_and_record(
                 key, {"requests": 1, "hits": 1, "bytes_served": len(served)}
             )
             self._hits += 1
@@ -468,14 +580,14 @@ class CacheService:
                         key, req, provider, model, params_canon,
                         stitched, "pcm_s16le", 16000, existing=record,
                     )
-                audio = convert_audio(
+                audio = await self._convert_audio(
                     stitched,
                     native_encoding="pcm_s16le",
                     native_rate=16000,
                     out_encoding=of.encoding,
                     out_rate=of.sample_rate,
                 )
-                await self._metadata.record_metrics(
+                await self._metrics.record_metrics(
                     requests=1, misses=1, bytes_served=len(audio), synth_calls=1
                 )
                 self._misses += 1
@@ -490,11 +602,23 @@ class CacheService:
             raise ProviderNotConfigured(provider)
 
         if _same_format(of.encoding, of.sample_rate, instance.native_encoding, instance.native_sample_rate):
+            # Single-flight: if a synth is already in-flight for this key (bytes
+            # or stream path), coalesce onto it — await the result and stream the
+            # completed clip — instead of opening a 2nd provider stream. Else
+            # become the producer: register the future BEFORE any await so a
+            # concurrent request coalesces onto us (loop-thread-atomic).
+            fut = self._inflight.get(key)
+            if fut is not None and not fut.done():
+                return await self._stream_coalesced(
+                    req, key, fut, of, provider, instance, model, params_canon, record
+                )
+            fut = asyncio.get_running_loop().create_future()
+            self._inflight[key] = fut
             return (
                 {"X-Cache": "MISS", "X-Cache-Key": key},
                 self._stream_and_store(
                     req, instance, key, provider, model, params_canon, record,
-                    instance.native_encoding, instance.native_sample_rate,
+                    instance.native_encoding, instance.native_sample_rate, fut,
                 ),
             )
 
@@ -505,14 +629,14 @@ class CacheService:
                 key, req, provider, model, params_canon,
                 native.audio, native.encoding, native.sample_rate, existing=record,
             )
-        audio = convert_audio(
+        audio = await self._convert_audio(
             native.audio,
             native_encoding=native.encoding,
             native_rate=native.sample_rate,
             out_encoding=of.encoding,
             out_rate=of.sample_rate,
         )
-        await self._metadata.record_metrics(
+        await self._metrics.record_metrics(
             requests=1, misses=1, bytes_served=len(audio), synth_calls=1
         )
         self._misses += 1
@@ -529,6 +653,7 @@ class CacheService:
         record,
         native_encoding: str,
         native_sample_rate: int,
+        fut: asyncio.Future,
     ) -> AsyncGenerator[bytes, None]:
         """Forward native provider chunks to the caller; store native on success.
 
@@ -539,6 +664,7 @@ class CacheService:
         """
         accumulated = bytearray()
         completed = False
+        gate = get_gate(provider)
         gen = instance.stream_synth(
             text=req.transcript,
             voice_id=req.voice.id,
@@ -547,10 +673,12 @@ class CacheService:
             params=req.params,
         )
         try:
-            async for chunk in gen:
-                accumulated += chunk
-                yield chunk
-            completed = True
+            # Hold the gate for the whole stream — it IS an in-flight synth.
+            async with gate:
+                async for chunk in gen:
+                    accumulated += chunk
+                    yield chunk
+                completed = True
         finally:
             await gen.aclose()
             if completed and accumulated:
@@ -560,13 +688,69 @@ class CacheService:
                         key, req, provider, model, params_canon,
                         audio, native_encoding, native_sample_rate, existing=record,
                     )
-                await self._metadata.record_metrics(
+                await self._metrics.record_metrics(
                     requests=1, misses=1, bytes_served=len(audio), synth_calls=1
                 )
                 self._misses += 1
+                if not fut.done():
+                    fut.set_result((audio, native_encoding, native_sample_rate, "MISS"))
                 logger.info(
                     f"CACHE STORE (stream) key={key[:12]}… provider={provider} size={len(audio)}B"
                 )
+            elif not fut.done():
+                # Aborted (client disconnect) or provider error: partial audio is
+                # discarded (never cached). Signal coalesced waiters to fall back
+                # to their own synth rather than 502 on someone else's failure.
+                fut.set_exception(ProviderError("stream synth failed or aborted"))
+            if self._inflight.get(key) is fut:
+                self._inflight.pop(key, None)
+
+    async def _stream_coalesced(
+        self, req, key, fut, of, provider, instance, model, params_canon, record,
+    ) -> tuple[dict, AsyncGenerator[bytes, None]]:
+        """Serve a streaming MISS by awaiting an in-flight producer for ``key``.
+
+        The producer (bytes- or stream-path) is already synthesizing; we wait for
+        its result, then stream the completed clip in chunks (a coalesced HIT). If
+        the producer aborted/failed, fall through to our own live synth — by the
+        time ``await fut`` raises, the producer has cleared ``_inflight``, so we're
+        the only contender. (CancelledError is NOT caught: a cancelled waiter dies.)
+        """
+        try:
+            native, enc, rate, _status = await fut
+        except Exception:
+            # Producer failed. Another waiter may already have become the new
+            # producer — re-check _inflight and coalesce onto it instead of each
+            # waiter spawning its own synth (bounds a producer failure to ONE
+            # retry, not N).
+            existing = self._inflight.get(key)
+            if existing is not None and not existing.done():
+                return await self._stream_coalesced(
+                    req, key, existing, of, provider, instance, model, params_canon, record
+                )
+            fut = asyncio.get_running_loop().create_future()
+            self._inflight[key] = fut
+            return (
+                {"X-Cache": "MISS", "X-Cache-Key": key},
+                self._stream_and_store(
+                    req, instance, key, provider, model, params_canon, record,
+                    instance.native_encoding, instance.native_sample_rate, fut,
+                ),
+            )
+        served = (
+            native
+            if _same_format(of.encoding, of.sample_rate, enc, rate)
+            else await self._convert_audio(
+                native, native_encoding=enc, native_rate=rate,
+                out_encoding=of.encoding, out_rate=of.sample_rate,
+            )
+        )
+        await self._metrics.touch_and_record(
+            key, {"requests": 1, "hits": 1, "bytes_served": len(served)}
+        )
+        self._hits += 1
+        logger.info(f"CACHE HIT (stream-coalesced) key={key[:12]}… provider={provider}")
+        return {"X-Cache": "HIT", "X-Cache-Key": key}, _chunked(served)
 
     # -- admin ops -----------------------------------------------------------
 
@@ -604,12 +788,12 @@ class CacheService:
 
         await self._store(
             key, req, provider, model, params_canon,
-            audio, store_encoding, store_rate, existing=existing,
+            audio, store_encoding, store_rate, existing=existing, replace=True,
         )
         if source == "synth":
-            await self._metadata.record_metrics(creates=1, synth_calls=1)
+            await self._metrics.record_metrics(creates=1, synth_calls=1)
         else:
-            await self._metadata.record_metrics(creates=1, base64_uploads=1)
+            await self._metrics.record_metrics(creates=1, base64_uploads=1)
 
         status = "OVERRIDDEN" if overridden else "CREATED"
         logger.info(
@@ -646,12 +830,14 @@ class CacheService:
         # slice sub-phrases. The tracker's warmed-set ensures one warm per phrase.)
         aligned = False
         starts: list[float] = []
+        gate = get_gate(provider)
         try:
             if hasattr(instance, "synth_with_timestamps"):
-                audio, cwords, starts = await instance.synth_with_timestamps(
-                    text=req.transcript, voice_id=req.voice.id, model=model,
-                    language=req.language, params=req.params,
-                )
+                async with gate:
+                    audio, cwords, starts = await instance.synth_with_timestamps(
+                        text=req.transcript, voice_id=req.voice.id, model=model,
+                        language=req.language, params=req.params,
+                    )
                 aligned = bool(cwords) and len(cwords) == len(norm_words)
             else:
                 raise NotImplementedError
@@ -700,7 +886,7 @@ class CacheService:
             )
             stored += 1
 
-        await self._metadata.record_metrics(creates=stored, synth_calls=1)
+        await self._metrics.record_metrics(creates=stored, synth_calls=1)
         logger.info(
             f"WARM-SPLIT key={key[:12]}… provider={provider} words={n} "
             f"stored={stored} aligned={aligned}"
@@ -708,33 +894,35 @@ class CacheService:
         return stored
 
     async def delete(self, req: TTSRequest):
-        """Delete by derived key. Returns (deleted_bool, key)."""
+        """Delete by derived key. Returns (deleted_bool, key).
+
+        The store adjusts provider_totals atomically inside the DELETE
+        transaction (using the row's actual size at delete time), so a concurrent
+        override of the same key can't make totals drift."""
         provider, model, of, params_canon, key = self._resolve(req)
         record = await self._metadata.get(key)
         if not record:
             return False, key
-        # Only adjust totals if we actually removed the row — a concurrent
-        # clear/delete could have taken it first (else totals double-decrement).
+        # storage_path is key-derived (content-addressed), so it's correct even
+        # if a concurrent override rewrote the row's bytes between get and delete.
         if not await self._metadata.delete(key):
             return False, key
         await self._blobs.delete(record.storage_path)
-        await self._metadata.adjust_totals(record.provider, -1, -record.size_bytes)
-        await self._metadata.record_metrics(deletes=1)
+        await self._metrics.record_metrics(deletes=1)
         logger.info(f"DELETE key={key[:12]}… provider={provider}")
         return True, key
 
     async def clear(self, provider: str | None = None, voice_id: str | None = None) -> int:
-        """Delete all entries (optionally filtered). Returns count removed."""
+        """Delete all entries (optionally filtered). Returns count removed.
+
+        The store adjusts provider_totals atomically inside the DELETE
+        transaction (SELECT+DELETE in one txn, so a concurrent insert can't
+        escape the clear)."""
         deleted = await self._metadata.delete_filtered(provider=provider, voice_id=voice_id)
-        deltas: dict[str, list[int]] = defaultdict(lambda: [0, 0])
-        for prov, size, path in deleted:
-            deltas[prov][0] -= 1
-            deltas[prov][1] -= size
+        for _prov, _size, path in deleted:
             await self._blobs.delete(path)
-        for prov, (de, db) in deltas.items():
-            await self._metadata.adjust_totals(prov, de, db)
         if deleted:
-            await self._metadata.record_metrics(deletes=len(deleted))
+            await self._metrics.record_metrics(deletes=len(deleted))
         logger.info(f"CLEAR removed {len(deleted)} entries (provider={provider}, voice_id={voice_id})")
         return len(deleted)
 

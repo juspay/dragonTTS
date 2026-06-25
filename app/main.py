@@ -47,6 +47,7 @@ async def lifespan(app: FastAPI):
     app.state.blobs = blobs
     app.state.registry = registry
     cache = CacheService(metadata, blobs, registry.get)
+    await cache.start()  # write-behind metrics flusher
     app.state.cache = cache
 
     # Predictive warmer: watches requests and pre-warms recurring phrase
@@ -61,6 +62,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"DragonTTS ready — providers: {registry.configured()}")
     yield
     await tracker.stop()
+    await cache.stop()  # flush write-behind metrics (graceful shutdown loses none)
     await registry.aclose_all()
     executor.shutdown(wait=False, cancel_futures=True)  # releases worker sqlite conns
 

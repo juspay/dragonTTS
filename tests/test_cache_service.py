@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from app.cache.service import CacheService
@@ -203,4 +205,72 @@ def test_stitch_clips_equalizes_loudness():
     r_loud = float(np.sqrt(np.mean(out[half : half * 2] ** 2)))
     assert r_quiet > 0.05                            # quiet clip was amplified up
     assert max(r_quiet, r_loud) / max(1e-6, min(r_quiet, r_loud)) < 4.0  # roughly matched
+
+
+# -- single-flight + totals correctness ------------------------------------
+
+
+async def test_single_flight_concurrent_misses_share_one_synth(svc, fake_provider):
+    """N concurrent identical MISSes share ONE synth + ONE store (single-flight):
+    the producer records a MISS, coalesced callers record HITs, and the provider
+    is hit exactly once."""
+    req = _req_text("the quick brown fox jumps")
+    results = await asyncio.gather(*(svc.get_or_synthesize(req) for _ in range(8)))
+    assert fake_provider.calls == 1  # one synth despite 8 concurrent misses
+    audios = [a for a, _ in results]
+    assert all(a == audios[0] for a in audios) and len(audios[0]) > 0  # identical audio
+    statuses = [h["X-Cache"] for _, h in results]
+    assert statuses.count("MISS") == 1   # the producer
+    assert statuses.count("HIT") == 7    # coalesced onto the in-flight synth
+
+
+async def test_put_with_totals_concurrent_same_key_no_drift(tmp_storage):
+    """Concurrent fresh stores of the SAME key bump provider_totals exactly once
+    (per-worker-thread connections + INSERT OR IGNORE + rowcount), so /stats
+    never drifts under contention. This is the test that exposed the old
+    shared-connection concurrency bug."""
+    from app.storage.base import CacheRecord
+    from app.storage.sqlite import SQLiteMetadataStore
+
+    meta = SQLiteMetadataStore(settings.db_path)
+    await meta.init()
+    rec = CacheRecord(
+        key="k1", provider="cartesia", voice_id="v", model="m", language="en",
+        params="", text="t", container="raw", encoding="pcm_s16le", sample_rate=16000,
+        size_bytes=100, storage_path="ab/cd/k1", hit_count=0,
+        created_at="2026-01-01T00:00:00+00:00", last_accessed_at="2026-01-01T00:00:00+00:00",
+        ttl_expires_at=None,
+    )
+    await asyncio.gather(*(meta.put_with_totals(rec) for _ in range(16)))
+    snap = await meta.stats()
+    assert snap["entries"] == 1            # one row, not 16
+    assert snap["total_bytes"] == 100      # counted once, not 1600
+
+
+async def test_concurrent_distinct_writes_no_loss(tmp_storage):
+    """Many concurrent stores of DISTINCT keys all land (no lost writes) and
+    totals stay exact — the realistic 'N parallel misses on different phrases'
+    shape. Proves the per-worker-thread connection model is safe under load."""
+    from app.storage.base import CacheRecord
+    from app.storage.sqlite import SQLiteMetadataStore
+
+    meta = SQLiteMetadataStore(settings.db_path)
+    await meta.init()
+
+    def rec(i: int) -> CacheRecord:
+        return CacheRecord(
+            key=f"k{i}", provider="cartesia", voice_id="v", model="m", language="en",
+            params="", text="t", container="raw", encoding="pcm_s16le", sample_rate=16000,
+            size_bytes=10, storage_path=f"ab/cd/k{i}", hit_count=0,
+            created_at="2026-01-01T00:00:00+00:00",
+            last_accessed_at="2026-01-01T00:00:00+00:00", ttl_expires_at=None,
+        )
+
+    # 60 concurrent writes of distinct keys + 60 concurrent reads of the same.
+    await asyncio.gather(*(meta.put_with_totals(rec(i)) for i in range(60)))
+    got = await asyncio.gather(*(meta.get(f"k{i}") for i in range(60)))
+    snap = await meta.stats()
+    assert snap["entries"] == 60                 # none lost
+    assert snap["total_bytes"] == 60 * 10
+    assert all(r is not None for r in got)       # every key readable
 

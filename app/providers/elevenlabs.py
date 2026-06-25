@@ -1,52 +1,127 @@
 """ElevenLabs TTS provider adapter.
 
 Ports clairvoyance's ``_generate_elevenlabs_audio`` helper into the uniform
-``BaseTTSProvider`` contract. The registry constructs two instances of this
-class — one for the global API (``elevenlabs``) and one for the Indian
-residency API (``elevenlabs-in``) — differing only in ``api_key``/``base_url``.
+``BaseTTSProvider`` contract. There is a single ``elevenlabs`` route, wired to
+the Indian-residency endpoint (the only ElevenLabs account with API access).
 
-Native output format: raw ulaw 8 kHz bytes (ElevenLabs ``output_format=ulaw_8000``).
-A separate conversion layer (app/audio/format.py) maps this to the caller's
-requested ``output_format`` before caching.
+Native output format: raw PCM 16 kHz (ElevenLabs ``output_format=pcm_16000``),
+matching every other provider so a single cache entry serves all formats on read
+and the streaming path live-forwards 16 kHz chunks to a 16 kHz caller. A
+separate conversion layer (app/audio/format.py) maps this to the caller's
+requested ``output_format`` (e.g. μ-law 8 kHz for telephony) before caching.
+
+Two paths:
+- :meth:`synth` — one-shot HTTP ``/v1/text-to-speech/{voice}`` (used by
+  ``/tts/bytes`` misses, stitch, and the warmer).
+- :meth:`stream_synth` — the warm multi-context WebSocket pool
+  (:mod:`app.providers.elevenlabs_pool`), low TTFB on ``/tts/stream`` misses.
+  Falls back to one-shot HTTP if no warm socket is available.
 """
 
 from __future__ import annotations
+
+from collections.abc import AsyncGenerator
 
 import httpx
 
 from app.core.config import PROVIDER_DEFAULTS, settings
 from app.core.logging import logger
-from app.providers.base import AudioResult, BaseTTSProvider
+from app.providers import elevenlabs_pool
+from app.providers.base import AudioResult, BaseTTSProvider, ProviderError
 
 
 class ElevenLabsProvider(BaseTTSProvider):
     """ElevenLabs text-to-speech adapter.
 
-    A single instance speaks to one ElevenLabs deployment (global or Indian
-    residency); the registry wires the correct credentials per route.
+    A single instance speaks to one ElevenLabs deployment (the Indian-residency
+    endpoint); the registry wires the residency credentials to the
+    ``elevenlabs`` route.
     """
 
     name = "elevenlabs"
-    # ElevenLabs returns μ-law @ 8 kHz natively (matches the telephony output).
-    native_encoding = "ulaw"
-    native_sample_rate = 8000
+    # Native PCM @ 16 kHz so the conversation path streams live and the cache
+    # entry serves every requested format on read (μ-law/telephony is produced
+    # by convert-on-serve, as for the other 16 kHz-native providers).
+    native_encoding = "pcm_s16le"
+    native_sample_rate = 16000
 
     def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
         """Initialize the provider.
 
         Args:
-            api_key: ElevenLabs API key. Defaults to ``settings.elevenlabs_api_key``.
+            api_key: ElevenLabs API key. Defaults to
+                ``settings.elevenlabs_indian_residency_api_key``.
             base_url: ElevenLabs API base URL. Defaults to
-                ``settings.elevenlabs_base_url``.
+                ``settings.elevenlabs_indian_residency_base_url`` (the residency
+                host; the WS pool derives its wss host from this).
         """
-        self.api_key = api_key if api_key is not None else settings.elevenlabs_api_key
+        self.api_key = (
+            api_key if api_key is not None else settings.elevenlabs_indian_residency_api_key
+        )
         self.base_url = (
-            base_url if base_url is not None else settings.elevenlabs_base_url
+            base_url if base_url is not None else settings.elevenlabs_indian_residency_base_url
         )
         self._client = httpx.AsyncClient(timeout=30.0)
+        # One warm pool per (voice_id, model_id): the WS binds voice (URL path)
+        # and model_id (connect-time query param) for the socket's lifetime, so
+        # differing voice/model need separate sockets. Lazily created on first
+        # streaming miss; warmed eagerly when the model matches a default.
+        self._pools: dict[tuple[str, str], elevenlabs_pool.ElevenLabsStreamPool] = {}
+
+    def _voice_settings(self, params: dict) -> dict:
+        # Caller-supplied voice_settings win; otherwise mirror the one-shot defaults.
+        vs = (params or {}).get("voice_settings")
+        if isinstance(vs, dict) and vs:
+            return vs
+        return {"stability": 0.5, "similarity_boost": 0.75}
+
+    def _get_pool(self, voice_id: str, model_id: str) -> elevenlabs_pool.ElevenLabsStreamPool | None:
+        """Return the warm pool for (voice, model), creating it lazily.
+
+        Returns ``None`` when pooling is disabled (pool size 0) or the key is
+        missing, so the caller falls back to one-shot synth.
+        """
+        if not self.api_key or settings.elevenlabs_stream_pool_size < 1:
+            return None
+        key = (voice_id, model_id)
+        pool = self._pools.get(key)
+        if pool is None:
+            pool = elevenlabs_pool.ElevenLabsStreamPool(
+                api_key=self.api_key,
+                voice_id=voice_id,
+                model_id=model_id,
+                base_url=self.base_url,
+                idle_timeout=settings.elevenlabs_stream_idle_timeout,
+                min_size=settings.elevenlabs_stream_pool_size,
+                max_size=max(settings.elevenlabs_stream_pool_size * 2, settings.elevenlabs_stream_pool_size + 4),
+            )
+            self._pools[key] = pool
+        return pool
+
+    async def warm(self) -> None:
+        """Pre-warm the pool for the default voice+model (called at startup).
+
+        Other (voice, model) combos warm lazily on their first streaming miss.
+        """
+        if not self.api_key or settings.elevenlabs_stream_pool_size < 1:
+            return
+        defaults = PROVIDER_DEFAULTS.get("elevenlabs", {})
+        voice = defaults.get("voice_id", "")
+        model = defaults.get("model", "eleven_flash_v2_5")
+        if not voice or not model:
+            return
+        try:
+            pool = self._get_pool(voice, model)
+            if pool is not None:
+                await pool.start()
+        except Exception as e:
+            logger.warning(f"ElevenLabs stream pool warm failed: {e}")
 
     async def aclose(self) -> None:
         await self._client.aclose()
+        for pool in self._pools.values():
+            await pool.aclose()
+        self._pools.clear()
 
     async def synth(
         self,
@@ -57,7 +132,10 @@ class ElevenLabsProvider(BaseTTSProvider):
         language: str | None,
         params: dict,
     ) -> AudioResult:
-        """Synthesize ``text`` and return raw ulaw 8 kHz audio.
+        """Synthesize ``text`` and return raw PCM 16 kHz audio.
+
+        Uses the one-shot ``/v1/text-to-speech/{voice_id}`` HTTP endpoint with
+        ``output_format=pcm_16000``.
 
         Args:
             text: The text to synthesize.
@@ -67,10 +145,11 @@ class ElevenLabsProvider(BaseTTSProvider):
                 empty.
             language: BCP-47 language hint. Falls back to the provider default
                 when empty.
-            params: Extra provider-specific parameters (reserved for future use).
+            params: Extra provider-specific options. ``voice_settings`` is
+                honored if present.
 
         Returns:
-            AudioResult wrapping the provider's native ulaw_8000 bytes.
+            AudioResult wrapping the provider's native ``pcm_16000`` bytes.
 
         Raises:
             ValueError: If ``self.api_key`` is missing.
@@ -83,11 +162,11 @@ class ElevenLabsProvider(BaseTTSProvider):
         final_model_id = model if model else defaults["model"]
         final_language = language if language else defaults["language"]
 
-        url = f"{self.base_url}/v1/text-to-speech/{final_voice_id}?output_format=ulaw_8000"
+        url = f"{self.base_url}/v1/text-to-speech/{final_voice_id}?output_format=pcm_16000"
         headers = {
             "xi-api-key": self.api_key,
             "Content-Type": "application/json",
-            "Accept": "audio/basic",
+            "Accept": "audio/raw",
         }
         # NOTE: language_code is intentionally NOT sent — the ElevenLabs
         # /v1/text-to-speech/{voice_id} body has no such field (language is
@@ -95,11 +174,11 @@ class ElevenLabsProvider(BaseTTSProvider):
         payload = {
             "text": text,
             "model_id": final_model_id,
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+            "voice_settings": self._voice_settings(params),
         }
 
         logger.info(
-            f"Synthesizing with ElevenLabs (ulaw_8000): {text[:50]}... "
+            f"Synthesizing with ElevenLabs (pcm_16000): {text[:50]}... "
             f"[voice_id={final_voice_id}, model_id={final_model_id}, "
             f"language={final_language}, base_url={self.base_url}]"
         )
@@ -109,6 +188,74 @@ class ElevenLabsProvider(BaseTTSProvider):
         return AudioResult(
             audio=response.content,
             container="raw",
-            encoding="ulaw",
-            sample_rate=8000,
+            encoding="pcm_s16le",
+            sample_rate=16000,
         )
+
+    async def stream_synth(
+        self,
+        *,
+        text: str,
+        voice_id: str,
+        model: str | None,
+        language: str | None,
+        params: dict,
+    ) -> AsyncGenerator[bytes, None]:
+        """Stream native PCM 16 kHz chunks via the warm multi-context WS pool.
+
+        Each utterance is sent on a warm socket (one handshake amortized across
+        many misses); ``is_final`` ends the stream and the context is closed. If
+        no warm socket is ready (pool disabled, circuit open, or cold start) and
+        nothing has been streamed yet, fall back to one-shot HTTP synth so the
+        miss still completes.
+
+        Raises:
+            ProviderError: If the API key is missing, or the socket fails after
+                audio has started streaming (can't safely fall back mid-stream).
+        """
+        if not self.api_key:
+            raise ProviderError("ELEVENLABS_API_KEY is required")
+
+        defaults = PROVIDER_DEFAULTS["elevenlabs"]
+        final_voice_id = voice_id if voice_id else defaults["voice_id"]
+        final_model_id = model if model else defaults["model"]
+        final_language = language if language else defaults["language"]
+
+        msg = {"text": text, "voice_settings": self._voice_settings(params)}
+        logger.info(
+            f"Streaming via ElevenLabs multi-context WS: {text[:50]}... "
+            f"[voice_id={final_voice_id}, model_id={final_model_id}]"
+        )
+
+        pool = self._get_pool(final_voice_id, final_model_id)
+        if pool is not None:
+            streamed_any = False
+            try:
+                async for chunk in pool.stream(msg):
+                    streamed_any = True
+                    yield chunk
+                return
+            except elevenlabs_pool.SocketUnavailable:
+                # WS pool unreachable (cold start, blocked handshake, circuit
+                # open). Only fall back if we haven't streamed partial audio.
+                if streamed_any:
+                    raise
+                logger.warning(
+                    "ElevenLabs WS unavailable — serving miss via one-shot HTTP synth"
+                )
+            except Exception as e:
+                # WS connected but the utterance failed (schema/quota/error frame).
+                # Only fall back if we haven't streamed partial audio yet.
+                if streamed_any:
+                    raise
+                logger.warning(
+                    f"ElevenLabs WS stream failed ({e}) — "
+                    f"serving miss via one-shot HTTP synth"
+                )
+
+        # Fallback: one-shot HTTP synth (also used when pooling is disabled).
+        result = await self.synth(
+            text=text, voice_id=final_voice_id, model=final_model_id,
+            language=final_language, params=params,
+        )
+        yield result.audio

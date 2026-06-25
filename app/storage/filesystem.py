@@ -1,59 +1,41 @@
 """Filesystem blob store — content-addressed, sharded (ab/cd/<key>).
 
-A byte-bounded in-memory LRU sits in front of the disk so hot cache hits skip
-the file read entirely (no thread hop). The LRU is kept consistent because
-``put`` pre-warms/overwrites and ``delete`` evicts — overrides reuse the same
-content-addressed path, so stale entries can't survive.
+No in-process cache: hot reads are served by the OS page cache (kernel-managed,
+self-invalidating), which makes an application-level LRU redundant — it only saved
+~tens of μs over a page-cache hit, cost 64MB of heap, and its invalidation was a
+correctness hazard. Bound the pod's memory with a k8s limit so the kernel caps the
+page cache under pressure.
+
+Writes ``fsync`` the file so the blob is at least as durable as the metadata row that
+references it — ``cache/service._store`` writes the blob BEFORE committing metadata, so
+a crash can never leave a row pointing at a missing/truncated blob.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
+import os
+import threading
 from pathlib import Path
 
-from app.core.config import settings
 from app.core.logging import logger
 
 
 class FilesystemBlobStore:
-    def __init__(self, blob_dir: str, cache_bytes: int | None = None):
+    def __init__(self, blob_dir: str):
         self.blob_dir = Path(blob_dir)
-        self._max_bytes = cache_bytes if cache_bytes is not None else settings.blob_cache_bytes
-        self._lru: "OrderedDict[str, bytes]" = OrderedDict()
-        self._size = 0
+        # Shard dirs known to already exist; lets put() skip the mkdir syscall on
+        # every write after the first per dir (mkdir is costly on a networked PVC).
+        # Guarded by a lock because concurrent worker threads call put().
+        self._seen_dirs: set[Path] = set()
+        self._dirs_lock = threading.Lock()
 
     async def init(self) -> None:
         await asyncio.to_thread(self.blob_dir.mkdir, parents=True, exist_ok=True)
-        logger.info(
-            f"Filesystem blob store ready at {self.blob_dir} "
-            f"(in-memory LRU cap {self._max_bytes // (1024 * 1024)}MB)"
-        )
+        logger.info(f"Filesystem blob store ready at {self.blob_dir}")
 
     def _rel_path(self, key: str) -> Path:
         return Path(key[:2]) / key[2:4] / key
-
-    # -- LRU (event-loop-thread only; single-threaded, no lock needed) --------
-
-    def _cache_put(self, path: str, data: bytes) -> None:
-        if path in self._lru:
-            self._size -= len(self._lru[path])
-        self._lru[path] = data
-        self._size += len(data)
-        self._lru.move_to_end(path)
-        while self._size > self._max_bytes and self._lru:
-            _, evicted = self._lru.popitem(last=False)
-            self._size -= len(evicted)
-
-    def _cache_get(self, path: str) -> bytes | None:
-        data = self._lru.get(path)
-        if data is not None:
-            self._lru.move_to_end(path)
-        return data
-
-    def _cache_evict(self, path: str) -> None:
-        if path in self._lru:
-            self._size -= len(self._lru.pop(path))
 
     # -- store ops -----------------------------------------------------------
 
@@ -62,24 +44,31 @@ class FilesystemBlobStore:
 
         def _write() -> str:
             path = self.blob_dir / rel
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
+            parent = path.parent
+            # mkdir is idempotent but a syscall; skip it once the shard dir is
+            # known to exist. Double-checked so the lock is only taken on the
+            # first create of each dir, not on every write.
+            if parent not in self._seen_dirs:
+                with self._dirs_lock:
+                    if parent not in self._seen_dirs:
+                        parent.mkdir(parents=True, exist_ok=True)
+                        self._seen_dirs.add(parent)
+            # fsync so the blob is at least as durable as the metadata row
+            # committed after it. (Hot reads are served by the OS page cache, so
+            # there's no app-level cache to keep coherent here.)
+            with open(path, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
             return str(rel)
 
-        storage_path = await asyncio.to_thread(_write)
-        self._cache_put(storage_path, data)  # pre-warm: just written, likely read soon
-        return storage_path
+        return await asyncio.to_thread(_write)
 
     async def get(self, storage_path: str) -> bytes:
-        cached = self._cache_get(storage_path)
-        if cached is not None:
-            return cached
-        data = await asyncio.to_thread((self.blob_dir / storage_path).read_bytes)
-        self._cache_put(storage_path, data)
-        return data
+        # No app-level cache: served straight from the OS page cache (hot) or disk.
+        return await asyncio.to_thread((self.blob_dir / storage_path).read_bytes)
 
     async def delete(self, storage_path: str) -> bool:
-        self._cache_evict(storage_path)
         path = self.blob_dir / storage_path
 
         def _del() -> bool:

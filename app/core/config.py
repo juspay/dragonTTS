@@ -6,6 +6,7 @@ reused across both services.
 
 from __future__ import annotations
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Per-provider defaults. Ported from clairvoyance BB_SPEECH_PROVIDER_DEFAULTS.
@@ -33,12 +34,6 @@ PROVIDER_DEFAULTS: dict[str, dict] = {
         "speed": 1.15,
         "language": "en",
     },
-    "elevenlabs-in": {
-        "voice_id": "fG9s0SXJb213f4UxVHyG",
-        "model": "eleven_flash_v2_5",
-        "speed": 1.15,
-        "language": "en",
-    },
     "gemini": {
         "voice_id": "Kore",
         "model": "gemini-3.1-flash-tts-preview",
@@ -47,6 +42,11 @@ PROVIDER_DEFAULTS: dict[str, dict] = {
 }
 
 SUPPORTED_PROVIDERS = tuple(PROVIDER_DEFAULTS.keys())
+
+# Indian-residency ElevenLabs host (matches clairvoyance's residency endpoint).
+# The residency KEY is the only thing that must be supplied; the URL defaults
+# here and is coerced non-empty by the validator below even if .env blanks it.
+ELEVENLABS_INDIAN_RESIDENCY_URL = "https://api.in.residency.elevenlabs.io"
 
 
 class Settings(BaseSettings):
@@ -57,10 +57,18 @@ class Settings(BaseSettings):
     # --- Provider credentials (env names mirror clairvoyance) ---
     cartesia_api_key: str = ""
     sarvam_api_key: str = ""
-    elevenlabs_api_key: str = ""
-    elevenlabs_base_url: str = "https://api.elevenlabs.io"
+    # ElevenLabs runs ONLY against the Indian-residency endpoint (the only creds
+    # with API access). Env names mirror clairvoyance's residency Secret keys so
+    # the same k8s Secret is reused; the single "elevenlabs" route resolves here.
     elevenlabs_indian_residency_api_key: str = ""
-    elevenlabs_indian_residency_base_url: str = ""
+    elevenlabs_indian_residency_base_url: str = ELEVENLABS_INDIAN_RESIDENCY_URL
+
+    @field_validator("elevenlabs_indian_residency_base_url", mode="after")
+    @classmethod
+    def _coerce_residency_url(cls, v: str) -> str:
+        # An empty ELEVENLABS_INDIAN_RESIDENCY_BASE_URL= line in .env would
+        # otherwise blank the default; fall back to the known residency host.
+        return v or ELEVENLABS_INDIAN_RESIDENCY_URL
     google_credentials_json: str = ""
     google_credentials_path: str = ""
 
@@ -74,17 +82,46 @@ class Settings(BaseSettings):
     enable_write_through: bool = True
 
     # --- Performance ---
-    blob_cache_bytes: int = 64 * 1024 * 1024  # in-memory LRU cap for hot blobs
     thread_pool_workers: int = 64  # asyncio.to_thread pool size
     bulk_create_max: int = 1000  # hard cap on /tts/create/bulk items
     # Number of warm, persistent Cartesia streaming sockets kept ready for cache
     # misses (each multiplexes many utterances by context_id). Set via env, e.g.
     # CARTESIA_STREAM_POOL_SIZE=4. 0 => open a fresh socket per miss (no pooling).
     cartesia_stream_pool_size: int = 2
+    # Warm ElevenLabs multi-context WS sockets, pooled PER VOICE (the voice is in
+    # the WS URL). Each socket multiplexes up to 5 concurrent contexts. Streaming
+    # misses reuse a warm socket; if none is ready, fall back to one-shot HTTP.
+    elevenlabs_stream_pool_size: int = 2
+    # Max server-silence gap (seconds) after audio starts that ends an ElevenLabs
+    # WS utterance (ElevenLabs delays is_final ~20s). Lower = faster stream
+    # close/turn-end; raise if long utterances ever truncate at a >N s pause.
+    elevenlabs_stream_idle_timeout: float = 0.8
+    # Warm Sarvam WS sockets. Sarvam is NOT multiplexed (one utterance per socket
+    # at a time), so this is a LIFO stack of warm, pre-configured connections. 0
+    # => stream via a fresh socket per miss (no pooling).
+    sarvam_stream_pool_size: int = 2
     # Force IPv4 for the Cartesia WS handshake. Some networks advertise IPv6
     # (AAAA) for api.cartesia.ai but black-hole the SYN, hanging the handshake
     # while IPv4 works fine. Safe default (IPv4 always reaches Cartesia).
     cartesia_ws_force_ipv4: bool = True
+    # --- Resilience: per-provider bulkhead (concurrency cap) + rate limit ---
+    # Caps how many in-flight synth/stream calls ONE provider may have so a slow
+    # or hung provider can't exhaust shared resources (event loop, worker pool,
+    # memory) and starve the others. Global defaults; override per provider via
+    # the JSON env PROVIDER_RESILIENCE='{"cartesia":{"max_concurrent":20,
+    # "rate_per_sec":8,"wait_timeout_ms":2000}, ...}'. A 0 value disables that
+    # limiter. The bulkhead waits up to wait_timeout_ms for a slot, else 503.
+    provider_max_concurrent_synths: int = 24
+    provider_rate_limit_per_sec: float = 0.0
+    provider_bulkhead_wait_timeout_ms: int = 2500
+    provider_resilience_overrides: dict = {}
+    # --- Write-behind metrics (off the hot HIT path) ---
+    # HIT touch/metric updates are batched + flushed by a background task so a HIT
+    # returns audio without awaiting a SQLite write. Flush by interval or batch
+    # size, and on graceful shutdown. enabled=false -> synchronous writes.
+    metrics_write_behind_enabled: bool = True
+    metrics_flush_interval_ms: int = 500
+    metrics_flush_batch_size: int = 64
     # --- Predictive cache warming (Part 1: frequency-based auto-warm) ---
     # Tracks recurring phrase substrings across requests and warms the frequent
     # ones into the cache so Part 2 (segment + stitch) can assemble them.
@@ -110,7 +147,14 @@ class Settings(BaseSettings):
     # On a full-text MISS, binary-search cached prefix/suffix, synth only the
     # gaps, cross-fade at seams. Skipped below the coverage gate.
     predictive_stitch_enabled: bool = True
-    predictive_stitch_min_coverage: float = 0.5  # min cached fraction to stitch
+    # Stitch a MISS from cached sub-phrases when at least this fraction is cached
+    # (miss <= 1 - this). Default 0.25 = latency-favored (stitch when miss < 75%):
+    # the gap synth is <=75% of the phrase so it still beats a full synth on the
+    # first request, and the assembled clip is cached for instant repeat HITs.
+    # Override per-env via PREDICTIVE_STITCH_MIN_COVERAGE — raise to 0.5 for
+    # quality-favored (fewer seams); don't lower below ~0.2 (assembly overhead
+    # then outweighs the synth savings).
+    predictive_stitch_min_coverage: float = 0.25
     # Apply stitch on the /tts/stream path too (assemble + stream + cache).
     # Independent of the one-shot flag: live streaming has lower TTFB, so this is
     # the trade of "first request waits for gap-synth + assembly" vs "reuse cached
@@ -125,10 +169,8 @@ class Settings(BaseSettings):
             live.append("cartesia")
         if self.sarvam_api_key:
             live.append("sarvam")
-        if self.elevenlabs_api_key:
-            live.append("elevenlabs")
         if self.elevenlabs_indian_residency_api_key:
-            live.append("elevenlabs-in")
+            live.append("elevenlabs")
         if self.google_credentials_json or self.google_credentials_path:
             live.append("gemini")
         return live
