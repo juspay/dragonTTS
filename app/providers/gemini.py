@@ -70,7 +70,7 @@ class GeminiProvider(BaseTTSProvider):
         """Lazily build + cache the authenticated async gRPC client."""
         if self._client is None:
             if not self.credentials_json and not self.credentials_path:
-                raise ValueError(
+                raise ProviderError(
                     "GOOGLE_CREDENTIALS_JSON/PATH is required for Gemini TTS"
                 )
             if self.credentials_json:
@@ -166,8 +166,8 @@ class GeminiProvider(BaseTTSProvider):
             AudioResult holding raw ``pcm_s16le`` audio at 16 kHz.
 
         Raises:
-            ValueError: If neither ``credentials_json`` nor ``credentials_path``
-                is configured.
+            ProviderError: If neither ``credentials_json`` nor ``credentials_path``
+                is configured, or Gemini returns empty audio.
         """
         final_voice_id, final_model, final_language, style_prompt = self._resolve(
             voice_id=voice_id, model=model, language=language, params=params
@@ -200,7 +200,7 @@ class GeminiProvider(BaseTTSProvider):
 
         pcm_24k = b"".join(chunks)
         if not pcm_24k:
-            raise RuntimeError(
+            raise ProviderError(
                 "Gemini TTS returned empty audio — check credentials and voice settings"
             )
 

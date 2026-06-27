@@ -146,11 +146,40 @@ async def test_cap_opens_second_socket_when_first_full():
         await pool.aclose()
 
 
-async def test_error_message_fails_the_stream():
-    connect_fn, _ws = _connect_factory()
+async def test_socket_death_fails_the_stream():
+    """A socket drop marks every in-flight context dead, so an in-flight
+    ``pool.stream()`` raises ``ProviderError`` — the real
+    ``_mark_all_dead → _Err → stream re-raises`` path, not a hand-pushed queue
+    (the prior test never actually called ``pool.stream()``)."""
+
+    class _SilentWS:
+        """Records sends but never emits frames: the socket sits silent, then
+        drops, and the error is injected via ``_mark_all_dead``."""
+
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, msg_str):
+            self.sent.append(msg_str)
+
+        async def close(self):
+            return None
+
+        def __aiter__(self):
+            return self._iter()
+
+        async def _iter(self):
+            # An async generator (the `yield` makes it one) that never actually
+            # yields: it blocks forever, so the dispatch loop parks here until
+            # the connection is torn down at aclose().
+            while True:
+                await asyncio.Event().wait()
+                yield ""  # unreachable
+
+    ws = _SilentWS()
     pool = elevenlabs_pool.ElevenLabsStreamPool(
         api_key="k", voice_id="v1", model_id="eleven_flash_v2_5",
-        connect_fn=connect_fn, min_size=1,
+        connect_fn=lambda uri, headers: _FakeCM(ws), min_size=1,
     )
     await pool.start()
     for _ in range(100):
@@ -159,14 +188,16 @@ async def test_error_message_fails_the_stream():
         await asyncio.sleep(0.01)
     try:
         conn = pool._conns[0]
-        # inject an error frame for a context we're about to start
-        ctx = "dead-ctx"
-        q: asyncio.Queue = asyncio.Queue()
-        conn.contexts[ctx] = q
-        await q.put(elevenlabs_pool._Err(ProviderError("boom")))
+
+        async def _stream():
+            async for _ in pool.stream({"text": "hello"}):
+                pass
+
+        task = asyncio.create_task(_stream())
+        await asyncio.sleep(0.05)  # acquire the socket + register its context
+        conn._mark_all_dead("boom")  # socket drops -> each context queue gets _Err
         with pytest.raises(ProviderError):
-            item = await q.get()
-            raise item.exc
+            await task
     finally:
         await pool.aclose()
 

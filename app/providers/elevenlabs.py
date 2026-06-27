@@ -155,7 +155,7 @@ class ElevenLabsProvider(BaseTTSProvider):
             ValueError: If ``self.api_key`` is missing.
         """
         if not self.api_key:
-            raise ValueError("ELEVENLABS_API_KEY is required")
+            raise ValueError("ELEVENLABS_INDIAN_RESIDENCY_API_KEY is required")
 
         defaults = PROVIDER_DEFAULTS["elevenlabs"]
         final_voice_id = voice_id if voice_id else defaults["voice_id"]
@@ -214,7 +214,7 @@ class ElevenLabsProvider(BaseTTSProvider):
                 audio has started streaming (can't safely fall back mid-stream).
         """
         if not self.api_key:
-            raise ProviderError("ELEVENLABS_API_KEY is required")
+            raise ProviderError("ELEVENLABS_INDIAN_RESIDENCY_API_KEY is required")
 
         defaults = PROVIDER_DEFAULTS["elevenlabs"]
         final_voice_id = voice_id if voice_id else defaults["voice_id"]

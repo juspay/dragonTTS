@@ -50,6 +50,12 @@ async def lifespan(app: FastAPI):
     await cache.start()  # write-behind metrics flusher
     app.state.cache = cache
 
+    # Reap blob files orphaned by a prior crash mid-delete/clear (idempotent).
+    try:
+        await cache.reconcile_blobs()
+    except Exception as e:
+        logger.warning(f"blob reconcile failed: {e}")
+
     # Predictive warmer: watches requests and pre-warms recurring phrase
     # substrings so Part 2 (segment + stitch) can assemble them.
     from app.cache.tracker import FrequencyTracker
@@ -59,10 +65,31 @@ async def lifespan(app: FastAPI):
     tracker.start()
     app.state.tracker = tracker
 
+    # Periodic WAL checkpoint so the -wal file stays bounded on the PVC while
+    # worker connections are held open (passive auto-checkpoint won't shrink it).
+    async def _checkpoint_loop():
+        while True:
+            await asyncio.sleep(300)
+            try:
+                await metadata.checkpoint()
+            except Exception as e:
+                logger.debug(f"wal checkpoint failed: {e}")
+
+    checkpoint_task = asyncio.create_task(_checkpoint_loop())
+
     logger.info(f"DragonTTS ready — providers: {registry.configured()}")
     yield
+    checkpoint_task.cancel()
+    try:
+        await checkpoint_task
+    except (asyncio.CancelledError, Exception):
+        pass
     await tracker.stop()
     await cache.stop()  # flush write-behind metrics (graceful shutdown loses none)
+    try:
+        await metadata.checkpoint()  # compact the WAL before worker conns close
+    except Exception:
+        pass
     await registry.aclose_all()
     executor.shutdown(wait=False, cancel_futures=True)  # releases worker sqlite conns
 

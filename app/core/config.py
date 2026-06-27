@@ -6,7 +6,7 @@ reused across both services.
 
 from __future__ import annotations
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Per-provider defaults. Ported from clairvoyance BB_SPEECH_PROVIDER_DEFAULTS.
@@ -82,7 +82,7 @@ class Settings(BaseSettings):
     enable_write_through: bool = True
 
     # --- Performance ---
-    thread_pool_workers: int = 64  # asyncio.to_thread pool size
+    thread_pool_workers: int = 32  # asyncio.to_thread pool size
     bulk_create_max: int = 1000  # hard cap on /tts/create/bulk items
     # Number of warm, persistent Cartesia streaming sockets kept ready for cache
     # misses (each multiplexes many utterances by context_id). Set via env, e.g.
@@ -114,7 +114,7 @@ class Settings(BaseSettings):
     provider_max_concurrent_synths: int = 24
     provider_rate_limit_per_sec: float = 0.0
     provider_bulkhead_wait_timeout_ms: int = 2500
-    provider_resilience_overrides: dict = {}
+    provider_resilience_overrides: dict = Field(default_factory=dict)
     # --- Write-behind metrics (off the hot HIT path) ---
     # HIT touch/metric updates are batched + flushed by a background task so a HIT
     # returns audio without awaiting a SQLite write. Flush by interval or batch
@@ -140,8 +140,8 @@ class Settings(BaseSettings):
     predictive_warm_threshold_floor: float = 1.5  # never below this
     predictive_warm_min_words: int = 1  # shortest phrase length to track
     predictive_warm_max_words: int = 6  # cap on contiguous-substring length
-    predictive_warm_decay_factor: float = 0.9  # multiply all counts each interval
-    predictive_warm_decay_interval_s: int = 60  # how often decay runs
+    predictive_warm_decay_factor: float = 0.94  # counts x this each interval; with the 5-min interval below this is a ~1h half-life
+    predictive_warm_decay_interval_s: int = 300  # how often decay runs (5 min)
     predictive_warm_min_floor: float = 0.5  # prune counts below this after decay
     # --- Predictive stitching (Part 2: serve a MISS from cached sub-phrases) ---
     # On a full-text MISS, binary-search cached prefix/suffix, synth only the

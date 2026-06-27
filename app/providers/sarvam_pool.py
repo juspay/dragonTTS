@@ -86,6 +86,7 @@ class _SarvamConnection:
         self._send_lock = asyncio.Lock()
         self._closed = False
         self._busy = False  # in an utterance (pool-owned); gates idle pings
+        self._dirty = False  # prior utterance aborted non-cleanly -> reconnect
 
     async def run(self) -> None:
         """Connect, stay alive (idle pings), and reconnect on drop until stop()."""
@@ -95,6 +96,7 @@ class _SarvamConnection:
                 async with self._connect_fn(self._uri, self._headers) as ws:
                     self.ws = ws
                     self.ready.set()
+                    self._dirty = False  # fresh socket carries no stale frames
                     backoff = 0.5
                     logger.info("Sarvam stream socket ready")
                     last_ping = time.monotonic()
@@ -104,6 +106,17 @@ class _SarvamConnection:
                         if self._busy:
                             await asyncio.sleep(0.1)
                             continue
+                        if self._dirty:
+                            # The last utterance on this socket ended without a
+                            # clean ``final`` (client cancel / timeout / error
+                            # frame). Sarvam is single-stream with no per-
+                            # utterance routing, so its leftover frames would be
+                            # read as the NEXT caller's audio. Drop this socket
+                            # and reconnect to a fresh one (ready was already
+                            # cleared by stream()'s finally, so the pool can't
+                            # hand it out in the meantime).
+                            self._dirty = False
+                            break
                         now = time.monotonic()
                         if now - last_ping >= self._ping_interval:
                             last_ping = now
@@ -137,32 +150,49 @@ class _SarvamConnection:
         Yields raw PCM bytes (at the model's native rate; the provider resamples
         to 16 kHz) until the ``final`` event. Raises ``ProviderError`` on an
         error frame or a read timeout (a hung server).
+
+        On any exit other than a clean ``final`` (client cancel, timeout, error
+        frame) the socket is marked dirty and ``ready`` cleared: ``run`` then
+        drops + reconnects it, so Sarvam's leftover frames for THIS utterance
+        can never be read as a later caller's audio (single-stream, no per-
+        utterance routing — that would silently cross-contaminate cached clips).
         """
+        completed = False
         await self._send({"type": "config", "data": config})
         await self._send({"type": "text", "data": {"text": text}})
         await self._send({"type": "flush"})
-        while True:
-            try:
-                raw = await asyncio.wait_for(self.ws.recv(), timeout=self._recv_timeout)
-            except asyncio.TimeoutError as e:
-                raise ProviderError("sarvam stream timed out waiting for audio") from e
-            try:
-                m = json.loads(raw)
-            except (ValueError, TypeError):
-                continue  # ignore non-JSON / control frames
-            mtype = m.get("type")
-            if mtype == "audio":
-                audio_b64 = (m.get("data") or {}).get("audio")
-                if audio_b64:
-                    try:
-                        yield base64.b64decode(audio_b64)
-                    except Exception:
-                        pass
-            elif mtype == "event":
-                if (m.get("data") or {}).get("event_type") == "final":
-                    return
-            elif mtype == "error":
-                raise ProviderError(f"sarvam stream error: {m}")
+        try:
+            while True:
+                try:
+                    raw = await asyncio.wait_for(self.ws.recv(), timeout=self._recv_timeout)
+                except asyncio.TimeoutError as e:
+                    raise ProviderError("sarvam stream timed out waiting for audio") from e
+                try:
+                    m = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue  # ignore non-JSON / control frames
+                mtype = m.get("type")
+                if mtype == "audio":
+                    audio_b64 = (m.get("data") or {}).get("audio")
+                    if audio_b64:
+                        try:
+                            yield base64.b64decode(audio_b64)
+                        except Exception:
+                            pass
+                elif mtype == "event":
+                    if (m.get("data") or {}).get("event_type") == "final":
+                        completed = True
+                        return
+                elif mtype == "error":
+                    raise ProviderError(f"sarvam stream error: {m}")
+        finally:
+            if not completed:
+                # Aborted mid-utterance: Sarvam keeps streaming this transcript's
+                # audio into the socket buffer. Clearing ``ready`` keeps the pool
+                # from handing the socket out, and ``_dirty`` makes ``run`` drop
+                # + reconnect it so the next caller gets a clean socket.
+                self._dirty = True
+                self.ready.clear()
 
     async def stop(self) -> None:
         self._closed = True

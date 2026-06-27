@@ -148,11 +148,32 @@ class SQLiteMetadataStore:
                         "ON CONFLICT(provider) DO UPDATE SET "
                         "entries = excluded.entries, total_bytes = excluded.total_bytes"
                     )
+                # Compact any leftover -wal from a prior run now that the schema
+                # is open (runtime growth is bounded by the periodic checkpoint).
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:
+                    pass
             finally:
                 conn.close()
 
         await asyncio.to_thread(_setup)
         logger.info(f"SQLite metadata store ready at {self.db_path}")
+
+    async def checkpoint(self) -> None:
+        """Run a TRUNCATE WAL checkpoint so the ``-wal`` file is compacted back
+        into the main db. Passive auto-checkpoint (1000 frames) moves frames but
+        doesn't shrink the ``-wal`` while worker connections stay open, so this
+        is run on startup, periodically, and on shutdown to keep it bounded on
+        the PVC. Best-effort: never fails a request over a checkpoint error."""
+
+        def _cp(conn: sqlite3.Connection) -> None:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+
+        await self._run(_cp)
 
     def _conn(self) -> sqlite3.Connection:
         """Lazily-created, thread-local connection (cached for reuse). MUST be
@@ -232,6 +253,48 @@ class SQLiteMetadataStore:
 
         await self._run(_w)
 
+    async def replace_with_totals(self, record: CacheRecord) -> None:
+        """REPLACE an existing row and adjust ``provider_totals`` atomically.
+
+        Used by the refresh/override store path. ``put`` + ``adjust_totals``
+        separately would not be atomic: a concurrent ``delete`` of the same key
+        landing between them would drift ``provider_totals`` (delete decrements,
+        then the stale adjust re-applies a delta against a row that's gone). The
+        current row's size is re-read INSIDE the ``BEGIN IMMEDIATE`` transaction
+        so the delta reflects the row's actual state under the write lock.
+        ``provider`` can't change (it's part of the key), so only the size delta
+        matters for an existing row; a missing prior row is a fresh insert (+1).
+        """
+        values = tuple(getattr(record, c) for c in _COLUMNS)
+        placeholders = ",".join("?" for _ in _COLUMNS)
+        replace_sql = (
+            f"INSERT OR REPLACE INTO cache_entries ({','.join(_COLUMNS)}) "
+            f"VALUES ({placeholders})"
+        )
+        totals_sql = (
+            "INSERT INTO provider_totals (provider, entries, total_bytes) VALUES (?, ?, ?) "
+            "ON CONFLICT(provider) DO UPDATE SET "
+            "entries = entries + excluded.entries, total_bytes = total_bytes + excluded.total_bytes"
+        )
+
+        def _w(conn: sqlite3.Connection) -> None:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                prev = conn.execute(
+                    "SELECT size_bytes FROM cache_entries WHERE key = ?", (record.key,)
+                ).fetchone()
+                conn.execute(replace_sql, values)
+                if prev is None:
+                    conn.execute(totals_sql, (record.provider, 1, record.size_bytes))
+                else:
+                    conn.execute(totals_sql, (record.provider, 0, record.size_bytes - prev[0]))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+        await self._run(_w)
+
     async def touch(self, key: str) -> None:
         def _t(conn: sqlite3.Connection) -> None:
             conn.execute(
@@ -304,6 +367,14 @@ class SQLiteMetadataStore:
 
         rows = await self._run(_q)
         return [_row_to_record(r) for r in rows]
+
+    async def all_keys(self) -> set[str]:
+        """Every cache key — used to reap orphaned blob files."""
+
+        def _q(conn: sqlite3.Connection) -> set[str]:
+            return {row[0] for row in conn.execute("SELECT key FROM cache_entries")}
+
+        return await self._run(_q)
 
     async def delete_filtered(
         self, provider: str | None = None, voice_id: str | None = None

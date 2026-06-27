@@ -157,3 +157,80 @@ def test_model_sample_rate():
     assert sarvam_pool.model_sample_rate("bulbul:v2") == 22050
     assert sarvam_pool.model_sample_rate("bulbul:v3") == 24000
     assert sarvam_pool.model_sample_rate("unknown") == 24000  # safe default
+
+
+async def test_aborted_utterance_resets_socket_not_reused_dirty():
+    """Regression: an utterance that ends WITHOUT a clean ``final`` (timeout /
+    error / client cancel) must mark its socket dirty + clear ``ready``, and
+    ``run`` must then drop + reconnect it. Sarvam is single-stream with no
+    per-utterance routing, so without the reset the next caller would ``recv``
+    this transcript's leftover frames as its own audio (silent cross-contam)."""
+
+    class _BlockingWS:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, msg_str):
+            self.sent.append(msg_str)
+
+        async def recv(self):
+            await asyncio.Event().wait()  # never returns -> recv() times out
+
+        async def close(self):
+            return None
+
+    created: list[_BlockingWS] = []
+
+    def connect_fn(uri, headers):
+        class _CM:
+            async def __aenter__(self):
+                self.ws = _BlockingWS()
+                created.append(self.ws)
+                return self.ws
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _CM()
+
+    pool = sarvam_pool.SarvamStreamPool(
+        api_key="k", model="bulbul:v2", connect_fn=connect_fn, min_size=1, max_size=4,
+    )
+    await pool.start()
+    await _wait_ready(pool, 1)
+
+    conn = pool._conns[0]
+    conn._recv_timeout = 0.2  # don't wait the 30s default for the timeout
+
+    with pytest.raises(ProviderError):
+        async for _ in pool.stream({"speaker": "s"}, "hello"):
+            pass
+
+    # The aborted socket is excluded from the pool right away...
+    assert conn._dirty is True
+    assert conn.ready.is_set() is False
+    # ...and run() drops it + reconnects to a FRESH socket.
+    for _ in range(300):
+        if len(created) >= 2 and conn.ready.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert len(created) == 2          # reconnected exactly once
+    assert conn.ready.is_set() is True
+    assert conn._dirty is False       # fresh socket, flag cleared on connect
+
+    await pool.aclose()
+
+
+async def test_clean_utterance_keeps_socket_reusable():
+    """A normal (final-terminated) utterance must NOT trip the reset — the socket
+    stays ready and is handed back out. Guards the reset fix from over-firing."""
+    pool, _created = await _make_pool(min_size=1)
+    try:
+        chunks = await _collect(pool.stream({"speaker": "s"}, "hello"))
+        assert b"".join(chunks) == b"hello"
+        conn = pool._conns[0]
+        assert conn._dirty is False
+        assert conn.ready.is_set() is True
+        assert await pool.acquire() is conn   # same socket reused for the next call
+    finally:
+        await pool.aclose()

@@ -312,7 +312,6 @@ class CacheService:
         """
         if existing is _UNCHECKED:
             existing = await self._metadata.get(key)
-        old_size = existing.size_bytes if existing else 0
         now = datetime.now(timezone.utc)
         storage_path = await self._blobs.put(key, audio)
         ttl = (
@@ -343,11 +342,10 @@ class CacheService:
             # identical misses (only the first store inserts + bumps totals).
             await self._metadata.put_with_totals(record)
         else:
-            # Existing row (refresh) or explicit override: REPLACE + size delta.
-            await self._metadata.put(record)
-            await self._metadata.adjust_totals(
-                provider, 0 if existing else 1, len(audio) - old_size
-            )
+            # Existing row (refresh) or explicit override: REPLACE + totals
+            # delta in one transaction (put + adjust separately would let a
+            # concurrent delete drift provider_totals).
+            await self._metadata.replace_with_totals(record)
 
     async def _convert_audio(
         self, data: bytes, *, native_encoding: str, native_rate: int,
@@ -943,6 +941,23 @@ class CacheService:
             await self._metrics.record_metrics(deletes=len(deleted))
         logger.info(f"CLEAR removed {len(deleted)} entries (provider={provider}, voice_id={voice_id})")
         return len(deleted)
+
+    async def reconcile_blobs(self) -> int:
+        """Delete blob files that have no metadata row.
+
+        Such orphans arise when a crash/failure lands between a row-delete
+        commit and its blob unlink: delete/clear commit the row first to
+        preserve the "never a row pointing at a missing blob" invariant, at the
+        cost of a possible orphan FILE. Safe + idempotent to run at startup."""
+        live = await self._metadata.all_keys()
+        removed = 0
+        async for key, rel_path in self._blobs.iter_blobs():
+            if key not in live:
+                if await self._blobs.delete(rel_path):
+                    removed += 1
+        if removed:
+            logger.info(f"RECONCILE removed {removed} orphaned blob(s)")
+        return removed
 
     @property
     def session_stats(self) -> dict:

@@ -50,8 +50,6 @@ spec:
               value: "true"
             - name: THREAD_POOL_WORKERS
               value: "32"
-            - name: BLOB_CACHE_BYTES
-              value: "134217728"
             - name: BULK_CREATE_MAX
               value: "1000"
             # --- Predictive warming ---
@@ -68,9 +66,9 @@ spec:
             - name: PREDICTIVE_WARM_MAX_WORDS
               value: "12"
             - name: PREDICTIVE_WARM_DECAY_FACTOR
-              value: "0.9"
+              value: "0.94"
             - name: PREDICTIVE_WARM_DECAY_INTERVAL_S
-              value: "60"
+              value: "300"
             - name: PREDICTIVE_WARM_MIN_FLOOR
               value: "0.5"
             # --- Predictive stitching ---
@@ -85,10 +83,6 @@ spec:
               value: ""
             - name: SARVAM_API_KEY
               value: ""
-            - name: ELEVENLABS_API_KEY
-              value: ""
-            - name: ELEVENLABS_BASE_URL
-              value: "https://api.elevenlabs.io"
             - name: ELEVENLABS_INDIAN_RESIDENCY_API_KEY
               value: ""
             - name: ELEVENLABS_INDIAN_RESIDENCY_BASE_URL

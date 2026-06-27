@@ -144,9 +144,10 @@ class SarvamProvider(BaseTTSProvider):
         response.raise_for_status()
         result = response.json()
 
-        audio_base64 = result.get("audios", [None])[0]
+        audios = result.get("audios") or []
+        audio_base64 = audios[0] if audios else None
         if not audio_base64:
-            raise Exception("No audio returned from Sarvam API")
+            raise ProviderError("No audio returned from Sarvam API")
 
         audio = base64.b64decode(audio_base64)
         return AudioResult(

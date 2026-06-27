@@ -78,3 +78,20 @@ class FilesystemBlobStore:
             return False
 
         return await asyncio.to_thread(_del)
+
+    async def iter_blobs(self):
+        """Yield ``(key, rel_path)`` for every stored blob, for reconciliation.
+
+        ``rel_path`` matches what :meth:`delete` expects (``ab/cd/<key>``), and
+        ``key`` is the bare filename so it can be checked against the metadata
+        store's key set."""
+        def _scan():
+            out = []
+            for root, _dirs, files in os.walk(self.blob_dir):
+                for name in files:
+                    rel = str(Path(root).relative_to(self.blob_dir) / name)
+                    out.append((name, rel))
+            return out
+
+        for item in await asyncio.to_thread(_scan):
+            yield item

@@ -54,10 +54,15 @@ class WriteBehindMetrics:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
-        # Cancel any threshold-spawned flushes (redundant with the final drain).
-        for t in list(self._flush_tasks):
-            t.cancel()
-        self._flush_tasks.clear()
+        # Let any threshold-spawned flush finish writing its already-swapped-out
+        # batch before draining — cancelling it mid-write would drop those
+        # counters. Bounded by a timeout so a stuck flush can't hang shutdown;
+        # anything still pending after is caught by the final drain below.
+        if self._flush_tasks:
+            _done, pending = await asyncio.wait(list(self._flush_tasks), timeout=5.0)
+            for t in pending:
+                t.cancel()
+            self._flush_tasks.clear()
         await self._flush()  # final drain so graceful shutdown loses nothing
 
     async def touch_and_record(self, key: str, deltas: dict) -> None:
