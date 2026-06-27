@@ -17,9 +17,18 @@ from app.core.config import PROVIDER_DEFAULTS
 # Unit separator between key parts — prevents field-merge ambiguity.
 _SEP = "\x1f"
 
+# Invisible / zero-width characters to strip. LLM tokenization emits these as
+# artifacts inside transliterated words (e.g. Telugu "వెబ్‌సైట్" carries a ZWJ
+# ‌ between వెబ్ and సైట్). They have no TTS value, can make a provider
+# mis-synthesize the word (white noise), and would otherwise split one spoken
+# phrase into two cache keys (with-ZWJ vs without). Stripped before key + synth.
+_ZW = "​‌‍‎‏﻿­"
+_ZW_TABLE = str.maketrans("", "", _ZW)
+
 
 def normalize_text(text: str) -> str:
-    """NFC-normalize, then strip and collapse all internal whitespace runs."""
+    """Strip zero-width chars, NFC-normalize, then collapse internal whitespace."""
+    text = text.translate(_ZW_TABLE)
     return " ".join(unicodedata.normalize("NFC", text).split())
 
 

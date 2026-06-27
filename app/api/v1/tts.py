@@ -25,6 +25,7 @@ from app.audio.format import content_type_for
 from app.cache.key import parse_model_id
 from app.cache.resilience import ProviderBusy
 from app.core.config import settings
+from app.core.logging import logger
 from app.providers.base import ProviderError
 from app.providers.registry import ProviderNotConfigured
 from app.schemas.cache import CheckResponse, CreateResponse, DeleteResponse
@@ -83,6 +84,10 @@ async def tts_stream(req: TTSRequest, request: Request):
         provider, _ = parse_model_id(req.model_id)
         headers, gen = await cache.stream(req)
     except ValueError as e:
+        logger.warning(
+            f"/tts/stream 400 — {e} | model_id={req.model_id!r} "
+            f"transcript={req.transcript!r}"
+        )
         raise HTTPException(status_code=400, detail=str(e))
     except ProviderNotConfigured as e:
         raise HTTPException(status_code=503, detail=str(e))

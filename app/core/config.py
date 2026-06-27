@@ -160,6 +160,13 @@ class Settings(BaseSettings):
     # the trade of "first request waits for gap-synth + assembly" vs "reuse cached
     # sub-phrases and cache the assembled clip for instant repeat HITs".
     predictive_stitch_stream_enabled: bool = True
+    # --- Stitch seam-DSP knobs (numpy) — tune assembled-clip quality via env. ---
+    predictive_stitch_xfade_ms: float = 15.0        # crossfade overlap at each splice (10-25ms; short clicks, long smears)
+    predictive_stitch_target_rms_db: float = -20.0  # per-fragment loudness target (speech ~-23..-18 dBFS)
+    predictive_stitch_rms_floor_db: float = -55.0   # below this a fragment isn't amplified (don't hiss up a breath/gap)
+    predictive_stitch_sil_relative_db: float = 25.0 # silence gate: a window this many dB below the clip peak is trimmed (HIGHER = more aggressive gap cutting)
+    predictive_stitch_sil_guard_ms: float = 3.0     # sliver kept at each trimmed edge so onsets/offsets survive
+    predictive_stitch_zc_search_ms: float = 4.0     # window scanned for a zero crossing to anchor each splice (avoids clicks)
 
     @property
     def configured_providers(self) -> list[str]:

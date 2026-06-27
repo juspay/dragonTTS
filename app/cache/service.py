@@ -65,13 +65,17 @@ async def _chunked(data: bytes, size: int = _STREAM_CHUNK) -> AsyncGenerator[byt
 # plus an equal-power (constant-power) crossfade so the seam doesn't dip.
 # Pure numpy: no heavy voice deps, and this is also the audioop->Py3.13 path.
 
-_SR = 16_000              # native sample rate (pcm_s16le@16k)
-_XFADE_MS = 15.0          # equal-power crossfade overlap (~15ms; 10-25ms is the sweet spot)
-_TARGET_RMS_DB = -20.0    # per-clip loudness target (speech sits ~-23..-18 dBFS RMS)
-_RMS_FLOOR_DB = -55.0     # below this a clip is near-silent (breath/gap): don't amplify
-_SIL_THRESH = 0.012       # ~1% full-scale; windowed RMS below this = silence
-_SIL_GUARD_MS = 6.0       # guard kept at each trimmed edge so word onsets/offsets survive
-_ZC_SEARCH_MS = 4.0       # window scanned for a zero crossing to anchor the splice
+_SR = 16_000  # native sample rate (pcm_s16le@16k) — fixed (audio format), not tunable
+
+# Seam-DSP knobs — env-tunable (PREDICTIVE_STITCH_XFADE_MS, _TARGET_RMS_DB,
+# _RMS_FLOOR_DB, _SIL_RELATIVE_DB, _SIL_GUARD_MS, _ZC_SEARCH_MS). Read once at
+# import; change via env + restart. See app/core/config.py for what each does.
+_XFADE_MS = settings.predictive_stitch_xfade_ms
+_TARGET_RMS_DB = settings.predictive_stitch_target_rms_db
+_RMS_FLOOR_DB = settings.predictive_stitch_rms_floor_db
+_SIL_RELATIVE_DB = settings.predictive_stitch_sil_relative_db
+_SIL_GUARD_MS = settings.predictive_stitch_sil_guard_ms
+_ZC_SEARCH_MS = settings.predictive_stitch_zc_search_ms
 
 
 def _to_float(b: bytes) -> np.ndarray:
@@ -94,13 +98,21 @@ def _rms_normalize(x: np.ndarray) -> np.ndarray:
 
 
 def _trim_edges(x: np.ndarray, head: bool, tail: bool) -> np.ndarray:
-    """Trim leading/trailing near-silent samples (windowed RMS), keeping a guard."""
+    """Trim leading/trailing silence (windowed RMS), keeping a small guard.
+
+    The gate is ADAPTIVE — relative to this clip's loudest window, floored near
+    zero — so it works across voices/volumes and catches the low-amplitude
+    trailing decay Cartesia leaves on every clip. A fixed absolute threshold let
+    that decay survive, and those tails stacked into the audible pauses between
+    stitched fragments."""
     n = len(x)
     if n == 0:
         return x
     win = max(1, int(_SR * 1.0 / 1000))  # 1ms RMS window
     energy = np.convolve(x * x, np.ones(win, dtype=np.float32) / win, mode="same")
-    loud = energy > _SIL_THRESH * _SIL_THRESH
+    peak = float(energy.max()) + 1e-12
+    thresh = max(peak * (10.0 ** (-_SIL_RELATIVE_DB / 10.0)), 1e-9)
+    loud = energy > thresh
     if not loud.any():
         return x  # all-silent (e.g. test fixtures): leave untouched
     first = int(np.argmax(loud))
@@ -233,6 +245,12 @@ class CacheService:
     # -- internals -----------------------------------------------------------
 
     def _resolve(self, req: TTSRequest):
+        # Normalize the transcript once so the cache KEY and the text sent to the
+        # provider SYNTH stay in sync (strips LLM zero-width artifacts like the
+        # ZWJ in "వెబ్‌సైట్", collapses whitespace, NFC). Without this, the key
+        # was normalized but the synth text was raw — they could diverge, and ZWJ
+        # reached the provider (audible artifacts).
+        req.transcript = normalize_text(req.transcript)
         provider, model = parse_model_id(req.model_id)
         of = req.output_format
         params_canon = canonical_params(provider, req.params)
