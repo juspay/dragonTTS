@@ -1,7 +1,11 @@
 """Predictive cache warming — frequency tracking over contiguous phrase substrings.
 
-Every observed request is split into clauses (by punctuation), then into all
-bounded contiguous word substrings. A decayed frequency is maintained per
+Every observed request is tokenized like the cache key (punctuation kept), then
+split into segments at ``predictive_warm_split_chars`` endings (default ".").
+Within each segment all bounded contiguous word substrings are counted, so
+cross-segment fragments like "there. how" are never tracked and punctuation
+stays on the tokens so warmed keys match live request keys + stitch lookups. A
+decayed frequency is maintained per
 (context, phrase). When a phrase's decayed count crosses the threshold AND no
 longer frequent superstring exists (i.e. it's maximal), the phrase is warmed
 (synthesized + stored as a normal native cache entry) in the background, and its
@@ -17,16 +21,12 @@ entries keyed by (text + context), format-agnostic like everything else.
 from __future__ import annotations
 
 import asyncio
-import re
 from dataclasses import dataclass, field
 
 from app.cache.key import canonical_params, normalize_text
 from app.core.config import settings
 from app.core.logging import logger
 from app.schemas.tts import CartesiaVoice, TTSRequest
-
-# Clause separators: ASCII punctuation + Telugu danda "।".
-_CLAUSE_SPLIT = re.compile(r"[.,?!;:।\n]+")
 
 
 @dataclass
@@ -119,13 +119,16 @@ class FrequencyTracker:
         min_w = settings.predictive_warm_min_words
         max_w = settings.predictive_warm_max_words
 
-        # Pass 1: increment counts for every bounded contiguous substring.
+        # Tokenize like the cache key (punctuation KEPT), then bound sub-phrases
+        # to ``predictive_warm_split_chars`` segment endings. Sub-phrases never
+        # span a sentence boundary (so "there. how" — never reusable — isn't
+        # tracked), and because punctuation stays on the tokens, warmed keys
+        # match live request keys + stitch lookups exactly.
+        words = normalize_text(text).split()
+        split_set = set(settings.predictive_warm_split_chars)
         incremented: set[tuple[str, ...]] = set()
-        for clause in _CLAUSE_SPLIT.split(text):
-            words = normalize_text(clause).split()
-            if not words:
-                continue
-            for phrase in self._substrings(words, min_w, max_w):
+        for segment in self._segments(words, split_set):
+            for phrase in self._substrings(segment, min_w, max_w):
                 if phrase in state.warmed:
                     continue
                 state.counter[phrase] = state.counter.get(phrase, 0.0) + 1
@@ -158,6 +161,20 @@ class FrequencyTracker:
         for i in range(n):
             for j in range(i + min_w, min(i + max_w, n) + 1):
                 yield tuple(words[i:j])
+
+    @staticmethod
+    def _segments(words: list[str], split_set: set[str]):
+        """Yield word-list segments split at tokens whose last char is in
+        ``split_set`` (the delimiter char stays ON the token). Sub-phrases built
+        within a segment never span a sentence boundary."""
+        seg: list[str] = []
+        for w in words:
+            seg.append(w)
+            if w and w[-1] in split_set:
+                yield seg
+                seg = []
+        if seg:
+            yield seg
 
     @staticmethod
     def _all_subphrases(phrase: tuple[str, ...]):

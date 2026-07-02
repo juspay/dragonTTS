@@ -194,9 +194,55 @@ async def test_separates_clauses_and_warms_only_recurring_one(svc, fake_provider
             model="sonic-3.5", language="en", params={},
         )
     await tracker.drain()
-    assert await _cached(svc, "have a nice day")  # recurs -> warmed
+    assert await _cached(svc, "have a nice day.")  # recurs -> warmed (period kept)
     assert not await _cached(svc, "apple")  # one-off -> not warmed
     assert fake_provider.calls == 1
+
+
+async def test_period_splits_segments_no_cross_boundary(ts_svc, monkeypatch):
+    """A '.' ends a segment: each side is warmed independently (period kept on
+    the boundary token) and a cross-'.' fragment is never cached."""
+    tracker = _tracker_for(ts_svc, monkeypatch)
+    for _ in range(3):
+        await tracker.observe(
+            text="hi there. how are you", provider="cartesia", voice_id="v1",
+            model="sonic-3.5", language="en", params={},
+        )
+    await tracker.drain()
+    assert await _cached(ts_svc, "hi there.")        # segment 1 (period kept)
+    assert await _cached(ts_svc, "how are you")      # segment 2
+    assert not await _cached(ts_svc, "there. how")   # cross-'.' -> never tracked
+    assert not await _cached(ts_svc, "hi there. how are you")  # spans the boundary
+
+
+async def test_warm_keeps_punctuation_matching_live_keys(ts_svc, monkeypatch):
+    """Warmed keys keep punctuation so they match a live request for the same
+    text. (The old clause-split stripped it, so warmed entries never hit.)"""
+    tracker = _tracker_for(ts_svc, monkeypatch)
+    for _ in range(3):
+        await tracker.observe(
+            text="how are you.", provider="cartesia", voice_id="v1",
+            model="sonic-3.5", language="en", params={},
+        )
+    await tracker.drain()
+    assert await _cached(ts_svc, "how are you.")     # period kept -> matches live key
+    assert not await _cached(ts_svc, "how are you")  # no-period form is a different key
+
+
+async def test_split_chars_env_controls_delimiters(ts_svc, monkeypatch):
+    """PREDICTIVE_WARM_SPLIT_CHARS picks the delimiters; '.?!' also splits on '?'
+    (the default '.' would leave '?' continuous)."""
+    monkeypatch.setattr(settings, "predictive_warm_split_chars", ".?!")
+    tracker = _tracker_for(ts_svc, monkeypatch)
+    for _ in range(3):
+        await tracker.observe(
+            text="hi there? how are you", provider="cartesia", voice_id="v1",
+            model="sonic-3.5", language="en", params={},
+        )
+    await tracker.drain()
+    assert await _cached(ts_svc, "hi there?")        # '?' ended the segment
+    assert await _cached(ts_svc, "how are you")
+    assert not await _cached(ts_svc, "there? how")   # cross-'?' not cached
 
 
 async def test_decay_ages_out_stale_phrases(svc, fake_provider, monkeypatch):

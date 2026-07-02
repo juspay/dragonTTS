@@ -46,12 +46,19 @@ spec:
             # --- Performance ---
             - name: CARTESIA_STREAM_POOL_SIZE
               value: "4"
+            - name: SARVAM_STREAM_POOL_SIZE
+              value: "2"
+            - name: ELEVENLABS_STREAM_POOL_SIZE
+              value: "2"
             - name: CARTESIA_WS_FORCE_IPV4
               value: "true"
             - name: THREAD_POOL_WORKERS
               value: "32"
             - name: BULK_CREATE_MAX
               value: "1000"
+            # --- Resilience: per-provider bulkhead (caps in-flight synths; excess waits up to wait_timeout_ms then 503) ---
+            - name: PROVIDER_RESILIENCE
+              value: '{"cartesia":{"max_concurrent":8,"wait_timeout_ms":3000},"sarvam":{"max_concurrent":8,"wait_timeout_ms":3000},"elevenlabs":{"max_concurrent":8,"wait_timeout_ms":3000}}'
             # --- Predictive warming ---
             - name: PREDICTIVE_WARM_ENABLED
               value: "true"
@@ -65,6 +72,8 @@ spec:
               value: "1"
             - name: PREDICTIVE_WARM_MAX_WORDS
               value: "12"
+            - name: PREDICTIVE_WARM_SPLIT_CHARS
+              value: "."
             - name: PREDICTIVE_WARM_DECAY_FACTOR
               value: "0.94"
             - name: PREDICTIVE_WARM_DECAY_INTERVAL_S

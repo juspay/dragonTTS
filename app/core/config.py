@@ -140,6 +140,12 @@ class Settings(BaseSettings):
     predictive_warm_threshold_floor: float = 1.5  # never below this
     predictive_warm_min_words: int = 1  # shortest phrase length to track
     predictive_warm_max_words: int = 6  # cap on contiguous-substring length
+    # Characters that end a sub-phrase segment: a token whose last char is in
+    # this string closes the segment, so sub-phrases never span one. Each char is
+    # a delimiter; default "." splits on sentence-ending periods. Punctuation is
+    # KEPT on the token, so warmed keys match live request keys + stitch lookups.
+    # Add chars (e.g. ".?!") to also split on those.
+    predictive_warm_split_chars: str = "."
     predictive_warm_decay_factor: float = 0.94  # counts x this each interval; with the 5-min interval below this is a ~1h half-life
     predictive_warm_decay_interval_s: int = 300  # how often decay runs (5 min)
     predictive_warm_min_floor: float = 0.5  # prune counts below this after decay
