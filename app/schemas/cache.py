@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 class CacheEntryInfo(BaseModel):
     key: str
+    text: str | None = None
     provider: str
     voice_id: str
     model: str

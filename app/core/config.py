@@ -80,6 +80,16 @@ class Settings(BaseSettings):
     max_cache_bytes: int = 0  # 0 = unlimited
     ttl_seconds: int = 0  # 0 = no expiry
     enable_write_through: bool = True
+    # --- TTS text normalization ---
+    # Expand standalone numbers to English words (Indian grouping) before synth,
+    # applied to both the synth text and the cache key (so "599" and
+    # "5 hundred 99" share one entry). ElevenLabs garbles digit+word hybrids
+    # ("5 hundred 99" -> "finee hundres"); expanding fixes it.
+    tts_normalize_numbers: bool = False
+    # ElevenLabs only: when true, ensure the text starts with "." — prepend one
+    # (no space) if missing, leave it if already present. Other providers read a
+    # leading "." fine, so they're unaffected.
+    tts_leading_dot: bool = True
 
     # --- Performance ---
     thread_pool_workers: int = 32  # asyncio.to_thread pool size
@@ -122,6 +132,12 @@ class Settings(BaseSettings):
     metrics_write_behind_enabled: bool = True
     metrics_flush_interval_ms: int = 500
     metrics_flush_batch_size: int = 64
+    # Latency sampling: fraction of requests timed for the avg/p95 rollup (0
+    # disables). perf_counter is cheap; sampling bounds latency_samples growth.
+    metrics_latency_sample_rate: float = 0.1
+    # latency_samples rows older than this are pruned by the periodic checkpoint
+    # loop, keeping the table bounded.
+    metrics_latency_retention_days: int = 14
     # --- Predictive cache warming (Part 1: frequency-based auto-warm) ---
     # Tracks recurring phrase substrings across requests and warms the frequent
     # ones into the cache so Part 2 (segment + stitch) can assemble them.
@@ -149,6 +165,13 @@ class Settings(BaseSettings):
     predictive_warm_decay_factor: float = 0.94  # counts x this each interval; with the 5-min interval below this is a ~1h half-life
     predictive_warm_decay_interval_s: int = 300  # how often decay runs (5 min)
     predictive_warm_min_floor: float = 0.5  # prune counts below this after decay
+    # Slice a warmed phrase's timestamped audio into every contiguous sub-phrase
+    # (Cartesia only — needs word boundaries). OFF by default: the recurring
+    # phrase is already cached whole by the request path, and the sub-phrase
+    # entries exist only to feed stitch's assembly. Flip to true to opt back into
+    # the substring-closed split (stitch then has a substrate to assemble from);
+    # the tracker still suppresses sub-phrases either way.
+    predictive_warm_split_enabled: bool = False
     # --- Predictive stitching (Part 2: serve a MISS from cached sub-phrases) ---
     # On a full-text MISS, binary-search cached prefix/suffix, synth only the
     # gaps, cross-fade at seams. Skipped below the coverage gate.

@@ -25,6 +25,16 @@ from app.storage.sqlite import SQLiteMetadataStore
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Route uvicorn's own loggers (access/error) through the loguru sink so GCP
+    # labels their severity too — they set propagate=False, so the root
+    # InterceptHandler alone misses them; override their handlers at startup.
+    import logging as _logging
+    from app.core.logging import InterceptHandler
+    for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        _lg = _logging.getLogger(_name)
+        _lg.handlers = [InterceptHandler()]
+        _lg.propagate = False
+
     # Sized executor for asyncio.to_thread (blocking sqlite/file I/O) so many
     # concurrent requests don't queue on the tiny default pool.
     loop = asyncio.get_running_loop()
@@ -72,8 +82,9 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(300)
             try:
                 await metadata.checkpoint()
+                await metadata.prune_latency(settings.metrics_latency_retention_days)
             except Exception as e:
-                logger.debug(f"wal checkpoint failed: {e}")
+                logger.debug(f"periodic maintenance failed: {e}")
 
     checkpoint_task = asyncio.create_task(_checkpoint_loop())
 

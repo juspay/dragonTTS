@@ -43,6 +43,15 @@ spec:
               value: "0"
             - name: ENABLE_WRITE_THROUGH
               value: "true"
+            # --- TTS text normalization ---
+            # Expand numbers to words (Indian: lakh/crore) before synth AND in the
+            # cache key, so ElevenLabs reads "5 hundred 99" correctly and "599"
+            # collapses to the same entry. Clear the cache after toggling.
+            - name: TTS_NORMALIZE_NUMBERS
+              value: "true"
+            # ElevenLabs only: prepend a leading "." if missing (true/false).
+            - name: TTS_LEADING_DOT
+              value: "true"
             # --- Performance ---
             - name: CARTESIA_STREAM_POOL_SIZE
               value: "4"
@@ -74,6 +83,12 @@ spec:
               value: "12"
             - name: PREDICTIVE_WARM_SPLIT_CHARS
               value: "."
+            # Slice a warmed phrase's timestamped audio into sub-phrase cache entries
+            # (Cartesia only). OFF by default — the whole phrase is already cached by
+            # the request path; sub-phrases only feed stitch assembly. Set "true" to
+            # opt back into the substring-closed split.
+            - name: PREDICTIVE_WARM_SPLIT_ENABLED
+              value: "false"
             - name: PREDICTIVE_WARM_DECAY_FACTOR
               value: "0.94"
             - name: PREDICTIVE_WARM_DECAY_INTERVAL_S

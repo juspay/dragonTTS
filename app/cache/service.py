@@ -16,6 +16,8 @@ cache snapshot is served from incrementally-maintained totals.
 from __future__ import annotations
 
 import asyncio
+import random
+import time
 
 import numpy as np
 from collections.abc import AsyncGenerator
@@ -23,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from app.audio.format import convert_audio
+from app.audio.text import normalize_for_tts
 from app.cache.metrics import WriteBehindMetrics
 from app.cache.resilience import get_gate
 from app.cache.key import (
@@ -38,6 +41,12 @@ from app.providers.base import AudioResult, BaseTTSProvider, ProviderError
 from app.providers.registry import ProviderNotConfigured
 from app.schemas.tts import TTSRequest
 from app.storage.base import CacheRecord
+
+
+def _wc(text: str | None) -> int:
+    """Word count of a transcript (whitespace tokens, punctuation kept)."""
+    return len((text or "").split())
+
 
 # Sentinel: caller has NOT pre-fetched the existing record (vs. None = checked,
 # genuinely absent). Avoids a redundant get() on every store when the caller
@@ -254,6 +263,10 @@ class CacheService:
         provider, model = parse_model_id(req.model_id)
         of = req.output_format
         params_canon = canonical_params(provider, req.params)
+        # Expand numbers to words (Indian grouping) for both the synth text and
+        # the key, so "599" and "5 hundred 99" share one cache entry. ElevenLabs
+        # also gets leading-dot handling; other providers read a stray "." fine.
+        req.transcript = normalize_for_tts(req.transcript, provider)
         key = hash_key(
             text=req.transcript,
             provider=provider,
@@ -271,6 +284,30 @@ class CacheService:
             and datetime.fromisoformat(record.ttl_expires_at) <= datetime.now(timezone.utc)
         )
 
+    async def _timed(self, kind: str, t0: float) -> None:
+        """Record a latency sample (sampling-gated) for the avg/p95 rollup."""
+        rate = settings.metrics_latency_sample_rate
+        if rate > 0 and random.random() < rate:
+            await self._metrics.record_latency(kind, int((time.perf_counter() - t0) * 1_000_000))
+
+    async def _timed_chunks(self, gen, t0: float):
+        """Wrap a streamed chunk generator so latency rides the stream lifecycle:
+        ``ttfb`` at the first yielded byte, ``total`` after the last. stream()
+        returns the generator BEFORE the request finishes (the caller iterates
+        it later), so end-to-end latency can't be recorded synchronously like
+        the one-shot bytes path — it must fire here. ``finally`` covers both
+        clean completion and a client disconnect (aclose). Each sample is
+        independently sampling-gated via :meth:`_timed`."""
+        first = True
+        try:
+            async for chunk in gen:
+                if first:
+                    await self._timed("ttfb", t0)
+                    first = False
+                yield chunk
+        finally:
+            await self._timed("total", t0)
+
     async def _synthesize(self, req: TTSRequest, provider: str, model: str) -> AudioResult:
         """Synthesize via the routed provider; return its NATIVE-format audio.
 
@@ -282,13 +319,16 @@ class CacheService:
             raise ProviderNotConfigured(provider)
         gate = get_gate(provider)
         async with gate:
-            return await instance.synth(
+            t0 = time.perf_counter()
+            result = await instance.synth(
                 text=req.transcript,
                 voice_id=req.voice.id,
                 model=model,
                 language=req.language,
                 params=req.params,
             )
+        await self._timed("synth", t0)
+        return result
 
     async def _store(
         self,
@@ -413,6 +453,14 @@ class CacheService:
             return native.audio
 
         pieces = await asyncio.gather(*(span_audio(lo, hi, c) for (lo, hi, c) in spans))
+        gap_words = len(words) - cached_words
+        await self._metrics.record_metrics(
+            provider=provider,
+            words_synthesized=gap_words,
+            stitch_calls=1,
+            stitch_words_assembled=cached_words,
+            stitch_words_synthesized=gap_words,
+        )
         logger.info(
             f"STITCH key=… provider={provider} words={len(words)} "
             f"spans={len(spans)} coverage={cached_words}/{len(words)}"
@@ -485,6 +533,7 @@ class CacheService:
 
     async def get_or_synthesize(self, req: TTSRequest) -> tuple[bytes, dict]:
         provider, model, of, params_canon, key = self._resolve(req)
+        t0 = time.perf_counter()
         await self._observe(
             text=req.transcript, provider=provider, voice_id=req.voice.id,
             model=model, language=req.language, params=req.params,
@@ -492,6 +541,7 @@ class CacheService:
 
         record = await self._metadata.get(key)
         if record and not self._expired(record):
+            t_cs = time.perf_counter()
             native = await self._blobs.get(record.storage_path)
             audio = await self._convert_audio(
                 native,
@@ -501,10 +551,14 @@ class CacheService:
                 out_rate=of.sample_rate,
             )
             await self._metrics.touch_and_record(
-                key, {"requests": 1, "hits": 1, "bytes_served": len(audio)}
+                key, {"requests": 1, "hits": 1, "bytes_served": len(audio),
+                      "words_served": _wc(req.transcript)},
+                provider=provider,
             )
             self._hits += 1
             logger.info(f"CACHE HIT  key={key[:12]}… provider={provider}")
+            await self._timed("cache_serve", t_cs)
+            await self._timed("total", t0)
             return audio, {"X-Cache": "HIT", "X-Cache-Key": key}
 
         logger.info(f"CACHE MISS key={key[:12]}… provider={provider} — synthesizing")
@@ -522,22 +576,26 @@ class CacheService:
         )
         if produced:
             await self._metrics.record_metrics(
-                requests=1, misses=1, bytes_served=len(audio), synth_calls=1
+                provider=provider,
+                requests=1, misses=1, bytes_served=len(audio), synth_calls=1,
+                words_served=_wc(req.transcript),
+                # stitch() already recorded the gap as words_synthesized; for a
+                # plain MISS the whole phrase was synthesized.
+                words_synthesized=_wc(req.transcript) if status == "MISS" else 0,
             )
             self._misses += 1
             logger.info(f"CACHE {status} key={key[:12]}… provider={provider}")
         else:
-            # Served from cache without our own synth: either coalesced onto an
-            # in-flight producer, or _produce found the warmer had filled the key
-            # (status='HIT'). Count as a HIT AND bump hit_count/last_accessed —
-            # the normal HIT path does this via touch_and_record; the single-
-            # flight path must too, or LRU recency goes stale under warming.
+            # Served from cache without our own synth: coalesced or warmer-filled.
             await self._metrics.touch_and_record(
-                key, {"requests": 1, "hits": 1, "bytes_served": len(audio)}
+                key, {"requests": 1, "hits": 1, "bytes_served": len(audio),
+                      "words_served": _wc(req.transcript)},
+                provider=provider,
             )
             self._hits += 1
             status = "HIT"
             logger.info(f"CACHE HIT (coalesced) key={key[:12]}… provider={provider}")
+        await self._timed("total", t0)
         return audio, {"X-Cache": status, "X-Cache-Key": key}
 
     # -- streaming read path ------------------------------------------------
@@ -552,6 +610,7 @@ class CacheService:
         MISS (requested != native): can't resample per-chunk, so synthesize
         native fully, store native, convert, then chunk.
         """
+        t0 = time.perf_counter()  # entry; total = entry -> last byte (via _timed_chunks)
         provider, model, of, params_canon, key = self._resolve(req)
         await self._observe(
             text=req.transcript, provider=provider, voice_id=req.voice.id,
@@ -560,6 +619,7 @@ class CacheService:
 
         record = await self._metadata.get(key)
         if record and not self._expired(record):
+            t_cs = time.perf_counter()
             native = await self._blobs.get(record.storage_path)
             if _same_format(of.encoding, of.sample_rate, record.encoding, record.sample_rate):
                 served, chunks = native, _chunked(native)
@@ -573,11 +633,14 @@ class CacheService:
                 )
                 chunks = _chunked(served)
             await self._metrics.touch_and_record(
-                key, {"requests": 1, "hits": 1, "bytes_served": len(served)}
+                key, {"requests": 1, "hits": 1, "bytes_served": len(served),
+                      "words_served": _wc(req.transcript)},
+                provider=provider,
             )
             self._hits += 1
             logger.info(f"CACHE HIT  (stream) key={key[:12]}… provider={provider}")
-            return {"X-Cache": "HIT", "X-Cache-Key": key}, chunks
+            await self._timed("cache_serve", t_cs)
+            return {"X-Cache": "HIT", "X-Cache-Key": key}, self._timed_chunks(chunks, t0)
 
         logger.info(
             f"CACHE MISS (stream) key={key[:12]}… provider={provider} — streaming synth"
@@ -604,14 +667,16 @@ class CacheService:
                     out_rate=of.sample_rate,
                 )
                 await self._metrics.record_metrics(
-                    requests=1, misses=1, bytes_served=len(audio), synth_calls=1
+                    provider=provider,
+                    requests=1, misses=1, bytes_served=len(audio), synth_calls=1,
+                    words_served=_wc(req.transcript), words_synthesized=0,
                 )
                 self._misses += 1
                 logger.info(
                     f"CACHE MISS-STITCH (stream) key={key[:12]}… "
                     f"provider={provider} size={len(audio)}B"
                 )
-                return {"X-Cache": "MISS-STITCH", "X-Cache-Key": key}, _chunked(audio)
+                return {"X-Cache": "MISS-STITCH", "X-Cache-Key": key}, self._timed_chunks(_chunked(audio), t0)
 
         instance = self._get_provider(provider)
         if instance is None:
@@ -625,16 +690,20 @@ class CacheService:
             # concurrent request coalesces onto us (loop-thread-atomic).
             fut = self._inflight.get(key)
             if fut is not None and not fut.done():
-                return await self._stream_coalesced(
+                _h, _g = await self._stream_coalesced(
                     req, key, fut, of, provider, instance, model, params_canon, record
                 )
+                return _h, self._timed_chunks(_g, t0)
             fut = asyncio.get_running_loop().create_future()
             self._inflight[key] = fut
             return (
                 {"X-Cache": "MISS", "X-Cache-Key": key},
-                self._stream_and_store(
-                    req, instance, key, provider, model, params_canon, record,
-                    instance.native_encoding, instance.native_sample_rate, fut,
+                self._timed_chunks(
+                    self._stream_and_store(
+                        req, instance, key, provider, model, params_canon, record,
+                        instance.native_encoding, instance.native_sample_rate, fut,
+                    ),
+                    t0,
                 ),
             )
 
@@ -653,10 +722,12 @@ class CacheService:
             out_rate=of.sample_rate,
         )
         await self._metrics.record_metrics(
-            requests=1, misses=1, bytes_served=len(audio), synth_calls=1
+            provider=provider,
+            requests=1, misses=1, bytes_served=len(audio), synth_calls=1,
+            words_served=_wc(req.transcript), words_synthesized=_wc(req.transcript),
         )
         self._misses += 1
-        return {"X-Cache": "MISS", "X-Cache-Key": key}, _chunked(audio)
+        return {"X-Cache": "MISS", "X-Cache-Key": key}, self._timed_chunks(_chunked(audio), t0)
 
     async def _stream_and_store(
         self,
@@ -705,7 +776,9 @@ class CacheService:
                         audio, native_encoding, native_sample_rate, existing=record,
                     )
                 await self._metrics.record_metrics(
-                    requests=1, misses=1, bytes_served=len(audio), synth_calls=1
+                    provider=provider,
+                    requests=1, misses=1, bytes_served=len(audio), synth_calls=1,
+                    words_served=_wc(req.transcript), words_synthesized=_wc(req.transcript),
                 )
                 self._misses += 1
                 if not fut.done():
@@ -762,7 +835,9 @@ class CacheService:
             )
         )
         await self._metrics.touch_and_record(
-            key, {"requests": 1, "hits": 1, "bytes_served": len(served)}
+            key, {"requests": 1, "hits": 1, "bytes_served": len(served),
+                  "words_served": _wc(req.transcript)},
+            provider=provider,
         )
         self._hits += 1
         logger.info(f"CACHE HIT (stream-coalesced) key={key[:12]}… provider={provider}")
@@ -819,44 +894,67 @@ class CacheService:
         return key, status, source, len(audio), provider, model, store_encoding, store_rate
 
     async def warm_split(self, req: TTSRequest) -> int:
-        """Predictive warm: synth the phrase ONCE with word timestamps, then
-        slice its audio into every contiguous sub-phrase and store each as a
-        native cache entry (check-before-store, so no re-synth).
+        """Predictive warm: cache the recurring phrase — and, when splitting is
+        enabled, slice its timestamped audio into every contiguous sub-phrase.
 
-        One Cartesia call per phrase; the resulting substring-closed set of
-        entries is what the binary-search segmentation on read relies on. If the
-        provider can't supply timestamps or Cartesia's word boundaries don't
-        align with the input words, falls back to storing just the full phrase.
+        Sub-phrase splitting is opt-in (``predictive_warm_split_enabled``) and
+        needs word boundaries (Cartesia only). When off (the default, matching
+        the other providers) the recurring phrase is already cached whole by the
+        request path, so this just ensures it exists (no wasted synth if it
+        does). When on, one timestamped synth is sliced into the substring-closed
+        set of entries stitch's binary-search assembly reads from; if the
+        provider can't supply timestamps or boundaries don't align, it falls back
+        to storing the whole phrase.
 
         Returns the number of (sub-)phrase entries stored.
         """
-        provider, model = parse_model_id(req.model_id)
+        # _resolve normalizes req.transcript (numbers -> words) in place and gives
+        # the key. Derive norm_words AFTER so word-index slicing matches the
+        # normalized text that gets synthesized (else the aligned-check breaks).
+        provider, model, _of, params_canon, key = self._resolve(req)
         instance = self._get_provider(provider)
         if instance is None:
             raise ProviderNotConfigured(provider)
 
-        norm_words = normalize_text(req.transcript).split()
+        norm_words = req.transcript.split()
         if not norm_words:
             return 0
-        _, _, _, _, key = self._resolve(req)
 
-        # Synth once; prefer timestamps so we can split. Fallback: full phrase.
-        # (We synth even if the full phrase is already cached: normal caching
-        # stores audio WITHOUT word boundaries, so we need a timestamped synth to
-        # slice sub-phrases. The tracker's warmed-set ensures one warm per phrase.)
+        # No sub-phrase splitting (disabled, or provider has no timestamps): the
+        # recurring phrase is almost always already cached from the request path,
+        # so check first to avoid a wasted synth; store the whole phrase only if
+        # it's genuinely new. The tracker still suppresses its sub-phrases.
+        if not (
+            settings.predictive_warm_split_enabled
+            and hasattr(instance, "synth_with_timestamps")
+        ):
+            existing = await self._metadata.get(key)
+            if existing and not self._expired(existing):
+                return 0
+            result = await self._synthesize(req, provider, model)
+            await self._store(
+                key, req, provider, model, params_canon,
+                result.audio, "pcm_s16le", 16000, existing=existing,
+            )
+            await self._metrics.record_metrics(creates=1, synth_calls=1)
+            logger.info(f"WARM (whole) key={key[:12]}… provider={provider} stored=1")
+            return 1
+
+        # Split path: synth once with word timestamps, slice into every
+        # contiguous sub-phrase (check-before-store, so no re-synth). We synth
+        # even if the full phrase is already cached: normal caching stores audio
+        # WITHOUT word boundaries, so we need a timestamped synth to slice. The
+        # tracker's warmed-set ensures one warm per phrase.
         aligned = False
         starts: list[float] = []
         gate = get_gate(provider)
         try:
-            if hasattr(instance, "synth_with_timestamps"):
-                async with gate:
-                    audio, cwords, starts = await instance.synth_with_timestamps(
-                        text=req.transcript, voice_id=req.voice.id, model=model,
-                        language=req.language, params=req.params,
-                    )
-                aligned = bool(cwords) and len(cwords) == len(norm_words)
-            else:
-                raise NotImplementedError
+            async with gate:
+                audio, cwords, starts = await instance.synth_with_timestamps(
+                    text=req.transcript, voice_id=req.voice.id, model=model,
+                    language=req.language, params=req.params,
+                )
+            aligned = bool(cwords) and len(cwords) == len(norm_words)
         except Exception as e:
             logger.warning(f"timestamped synth failed for warm ({e}); full-phrase store")
             result = await self._synthesize(req, provider, model)

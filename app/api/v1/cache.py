@@ -15,6 +15,7 @@ router = APIRouter()
 def _to_info(r) -> CacheEntryInfo:
     return CacheEntryInfo(
         key=r.key,
+        text=r.text,
         provider=r.provider,
         voice_id=r.voice_id,
         model=r.model,
@@ -73,11 +74,16 @@ async def stats(
     registry = request.app.state.registry
     metrics = await metadata.metrics_summary(from_date=from_date, to_date=to_date)
     snapshot = await metadata.stats()
+    providers = await metadata.provider_metrics_summary(from_date=from_date, to_date=to_date)
+    latency = await metadata.latency_summary(from_date=from_date, to_date=to_date)
     return {
         "range": {"from": from_date, "to": to_date},
         **metrics,
+        "providers": providers,
+        "latency": latency,
         "entries": snapshot["entries"],
         "total_bytes": snapshot["total_bytes"],
+        "total_words": snapshot["total_words"],
         "by_provider": snapshot["by_provider"],
         "providers_configured": registry.configured(),
         "session": request.app.state.cache.session_stats,

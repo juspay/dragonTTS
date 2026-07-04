@@ -27,6 +27,12 @@ class WriteBehindMetrics:
         self._flush_batch = max(1, flush_batch)
         self._touches: dict[str, dict[str, int]] = {}
         self._counters: dict[str, int] = {}
+        # Per-provider accumulators: provider-given calls route here (flushed via
+        # record_metrics(provider=...) which writes global + per-provider in one
+        # store call, so the global daily row is never double-counted).
+        self._provider_counters: dict[str, dict[str, int]] = {}
+        self._touch_provider: dict[str, str] = {}  # key -> provider (constant per key)
+        self._latency: list[tuple] = []  # (kind, latency_us) samples
         self._lock = asyncio.Lock()
         self._pending = 0
         self._task: asyncio.Task | None = None
@@ -65,20 +71,36 @@ class WriteBehindMetrics:
             self._flush_tasks.clear()
         await self._flush()  # final drain so graceful shutdown loses nothing
 
-    async def touch_and_record(self, key: str, deltas: dict) -> None:
+    async def touch_and_record(self, key: str, deltas: dict, *, provider: str | None = None) -> None:
         async with self._lock:
             d = self._touches.setdefault(key, {})
             for k, v in deltas.items():
                 d[k] = d.get(k, 0) + int(v)
+            if provider is not None:
+                self._touch_provider[key] = provider
             self._pending += 1
             hot = self._pending >= self._flush_batch
         if hot:
             self._spawn_flush()  # batch threshold -> flush promptly
 
-    async def record_metrics(self, **deltas: int) -> None:
+    async def record_metrics(self, *, provider: str | None = None, **deltas: int) -> None:
         async with self._lock:
-            for k, v in deltas.items():
-                self._counters[k] = self._counters.get(k, 0) + int(v)
+            if provider is not None:
+                pc = self._provider_counters.setdefault(provider, {})
+                for k, v in deltas.items():
+                    pc[k] = pc.get(k, 0) + int(v)
+            else:
+                for k, v in deltas.items():
+                    self._counters[k] = self._counters.get(k, 0) + int(v)
+            self._pending += 1
+            hot = self._pending >= self._flush_batch
+        if hot:
+            self._spawn_flush()
+
+    async def record_latency(self, kind: str, latency_us: int) -> None:
+        async with self._lock:
+            if len(self._latency) < 10000:  # bound memory if a flush ever stalls
+                self._latency.append((kind, int(latency_us)))
             self._pending += 1
             hot = self._pending >= self._flush_batch
         if hot:
@@ -89,18 +111,22 @@ class WriteBehindMetrics:
         # (so a slow flush doesn't block accumulation). Concurrent flushes are safe
         # — the later one swaps empty dicts and no-ops.
         async with self._lock:
-            if not self._touches and not self._counters:
+            if not (self._touches or self._counters or self._provider_counters or self._latency):
                 self._pending = 0
                 return
             touches, self._touches = self._touches, {}
+            touch_provider, self._touch_provider = self._touch_provider, {}
             counters, self._counters = self._counters, {}
+            provider_counters, self._provider_counters = self._provider_counters, {}
+            latency, self._latency = self._latency, []
             self._pending = 0
         for key, d in touches.items():
             try:
                 # The store's touch_and_record bumps hit_count by the ``hits``
                 # delta (default 1) and sums all deltas into the daily rollup, so
-                # one batched call == N synchronous calls exactly.
-                await self._meta.touch_and_record(key, d)
+                # one batched call == N synchronous calls exactly. The provider
+                # (constant per key) is forwarded so the per-provider row is written.
+                await self._meta.touch_and_record(key, d, provider=touch_provider.get(key))
             except Exception as e:
                 logger.warning(f"write-behind touch flush failed ({key[:8]}…): {e}")
         if counters:
@@ -108,6 +134,18 @@ class WriteBehindMetrics:
                 await self._meta.record_metrics(**counters)
             except Exception as e:
                 logger.warning(f"write-behind metrics flush failed: {e}")
+        for prov, d in provider_counters.items():
+            try:
+                # record_metrics(provider=...) writes the global daily row AND the
+                # per-provider subset in one store call (no double-count).
+                await self._meta.record_metrics(provider=prov, **d)
+            except Exception as e:
+                logger.warning(f"write-behind provider metrics flush failed ({prov}): {e}")
+        if latency:
+            try:
+                await self._meta.record_latency_batch(latency)
+            except Exception as e:
+                logger.warning(f"write-behind latency flush failed: {e}")
 
     async def _run(self) -> None:
         while not self._stopped:

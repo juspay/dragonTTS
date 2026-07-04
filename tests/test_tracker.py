@@ -102,6 +102,7 @@ async def _cached(svc: CacheService, text: str) -> bool:
 
 
 async def test_warm_split_creates_all_subphrases(ts_svc, monkeypatch):
+    monkeypatch.setattr(settings, "predictive_warm_split_enabled", True)  # opt in to split
     tracker = _tracker_for(ts_svc, monkeypatch)
     for _ in range(3):
         await tracker.observe(
@@ -120,6 +121,7 @@ async def test_warm_split_creates_all_subphrases(ts_svc, monkeypatch):
 
 
 async def test_warm_split_skips_subphrase_already_split(ts_svc, monkeypatch):
+    monkeypatch.setattr(settings, "predictive_warm_split_enabled", True)  # opt in to split
     tracker = _tracker_for(ts_svc, monkeypatch)
     # "how are you" warms + splits -> "how are" is already cached.
     for _ in range(3):
@@ -137,6 +139,42 @@ async def test_warm_split_skips_subphrase_already_split(ts_svc, monkeypatch):
         )
     await tracker.drain()
     assert ts_svc._fake.ts_calls == 1  # check-before-synth skipped it
+
+
+async def test_warm_split_disabled_stores_whole_only(ts_svc, monkeypatch):
+    """Split disabled (the default): even a timestamp-capable provider stores
+    only the whole phrase — Cartesia behaves like the others, no sub-phrase
+    slicing and no timestamped synth."""
+    # predictive_warm_split_enabled stays False (default)
+    tracker = _tracker_for(ts_svc, monkeypatch)
+    for _ in range(3):
+        await tracker.observe(
+            text="how are you", provider="cartesia", voice_id="v1",
+            model="sonic-3.5", language="en", params={},
+        )
+    await tracker.drain()
+    assert await _cached(ts_svc, "how are you")   # whole phrase cached
+    assert not await _cached(ts_svc, "how are")   # no sub-phrases
+    assert not await _cached(ts_svc, "you")
+    assert ts_svc._fake.ts_calls == 0             # no timestamped synth
+    assert ts_svc._fake.calls == 1                # one plain synth for the whole
+
+
+async def test_warm_split_disabled_noop_when_cached(ts_svc, monkeypatch):
+    """Split disabled + phrase already cached (from the request path) -> no synth
+    at all (no wasted synth on an already-cached recurring phrase)."""
+    # predictive_warm_split_enabled stays False (default)
+    await ts_svc.create(_req("how are you"))      # request path caches the whole
+    calls_before = ts_svc._fake.calls
+    tracker = _tracker_for(ts_svc, monkeypatch)
+    for _ in range(3):
+        await tracker.observe(
+            text="how are you", provider="cartesia", voice_id="v1",
+            model="sonic-3.5", language="en", params={},
+        )
+    await tracker.drain()
+    assert ts_svc._fake.calls == calls_before     # no synth — already cached
+    assert ts_svc._fake.ts_calls == 0
 
 
 # -- fallback path (no-timestamp provider) --------------------------------
@@ -286,6 +324,7 @@ async def test_threshold_scales_with_phrase_length(ts_svc, monkeypatch):
     """
     tracker = _tracker_for(ts_svc, monkeypatch)
     monkeypatch.setattr(settings, "predictive_warm_threshold_step", 0.5)
+    monkeypatch.setattr(settings, "predictive_warm_split_enabled", True)  # split path asserts ts_calls
 
     # 4-word phrase warms after only 2 occurrences (threshold 1.5).
     for _ in range(2):
