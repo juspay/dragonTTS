@@ -12,9 +12,11 @@ Scope (gated by ``TTS_NORMALIZE_NUMBERS``):
   * decimals -> "point" + up to 10 places: 5.99 -> "five point nine nine"
   * word-multipliers (hundred/thousand/lakh/crore) left as-is
 
-Leading-dot handling (``TTS_LEADING_DOT_MODE``, ElevenLabs only — Cartesia reads
-a stray "." fine): a "." immediately before the first digit (attached ".5" or
-spaced ". 5") is resolved per mode: drop / space / nospace.
+Leading-dot handling (``TTS_LEADING_DOT``, ElevenLabs only — Cartesia reads a
+stray "." fine): a "." is PREPENDED to the text sent to ElevenLabs (no space,
+idempotent) so it reads the first word/number cleanly. This is a SYNTH-only
+hint: it is applied by :func:`prepend_leading_dot` at the provider call site,
+NEVER to the cache key, so "your order" and ".your order" share one entry.
 """
 
 from __future__ import annotations
@@ -85,7 +87,8 @@ def normalize_numbers(text: str) -> str:
 
     Trailing sentence punctuation is kept ("99." -> "ninety nine."). A leading
     "." before a digit stays on the token (".5" -> ".five"); the ElevenLabs
-    leading-dot prepend is handled by :func:`normalize_for_tts`."""
+    leading-dot prepend is handled separately by :func:`prepend_leading_dot`
+    (synth-only, never the key)."""
     out = []
     for tok in text.split():
         m = _TOKEN_NUM.match(tok)
@@ -96,21 +99,37 @@ def normalize_numbers(text: str) -> str:
 
 
 def normalize_for_tts(text: str, provider: str) -> str:
-    """Number expansion (all providers) + ElevenLabs leading-dot prepend.
+    """Number expansion for the cache KEY and the synth-text base (all providers).
 
-    When ``tts_leading_dot`` is true and the provider is ElevenLabs, ensure the
-    text starts with "." — prepend one (no space) if missing, leave it if already
-    present. Other providers are unaffected. No-op when
-    ``TTS_NORMALIZE_NUMBERS`` is false."""
+    "599" and "5 hundred 99" collapse to one entry. No-op when
+    ``TTS_NORMALIZE_NUMBERS`` is false. This is KEY text — it must be
+    provider-hint-free, so the ElevenLabs leading dot is NOT applied here (it is
+    a synth-only concern, applied by :func:`prepend_leading_dot`). ``provider``
+    is accepted for call-site symmetry but currently does not alter the result.
+    """
     if not settings.tts_normalize_numbers:
         return text
-    text = normalize_numbers(text)
+    return normalize_numbers(text)
+
+
+def prepend_leading_dot(text: str, provider: str) -> str:
+    """ElevenLabs-only SYNTH hint: ensure ``text`` starts with "." (no space).
+
+    A stray leading dot makes ElevenLabs read the first word/number cleanly (it
+    garbles digit+word hybrids like "5 hundred 99" without it). Applied ONLY to
+    the text sent to the provider — never to the cache key — so equivalent inputs
+    ("your order" and ".your order") share one entry. Other providers are
+    unaffected. Idempotent (never double-dots) and a no-op for empty text.
+
+    Independent of number expansion: gated by ``TTS_LEADING_DOT`` alone, so the
+    dot still applies when ``TTS_NORMALIZE_NUMBERS`` is off."""
     if (
-        provider
-        and provider.strip().lower() == "elevenlabs"
-        and settings.tts_leading_dot
+        settings.tts_leading_dot
         and text
+        and text.strip()  # whitespace-only -> no bare "."
+        and provider
+        and provider.strip().lower() == "elevenlabs"
         and not text.startswith(".")
     ):
-        text = "." + text
+        return "." + text
     return text

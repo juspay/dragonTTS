@@ -1,89 +1,59 @@
-"""Binary-search phrase segmentation for cache-backed stitching.
+"""DP phrase segmentation for cache-backed stitching.
 
-Given a word count ``n`` and an async ``is_cached(start, end)`` predicate — true
-when ``words[start:end]`` is in the (substring-closed) cache — find the longest
-cached prefix and suffix via binary search, then recurse on the middle. Small
-middles are synthesized wholesale (avoid tiny low-prosody fragments).
+Given the request's word count and the set of sub-spans known to be cached
+(resolved by ONE batched key lookup in the caller), tile [0, n) into
+cached/synth spans that maximize cached coverage -- i.e. minimize the words
+synthesized. No substring-closure assumption (unlike the old binary search), so
+it works with a whole-phrase cache where arbitrary phrases happen to be cached:
+no need for the warmer to pre-split every phrase into a sub-phrase lattice.
 
-The binary search relies on monotonicity: under substring closure,
-``cached(words[0:k])`` implies ``cached(words[0:k-1])`` (a prefix of a cached
-phrase is itself cached), so the cached-prefix lengths form a contiguous
-``[1..b]`` range and a binary search finds ``b`` in O(log n) lookups. Same for
-suffixes.
-
-Returns a list of ``(start, end, is_cached)`` spans that tile ``[0, n)``.
+Returns a list of (start, end, is_cached) spans tiling [0, n), with consecutive
+same-type spans merged (a run of cached words -> one span; a run of gap words
+-> one span).
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-
-# Middles at or below this many words are synthesized wholesale (no further
-# splitting) to avoid stitching tiny fragments with poor prosody.
-SMALL = 3
-
-IsCached = Callable[[int, int], Awaitable[bool]]
+# Longest sub-span considered as a candidate cached clip. Bounds the candidate
+# set per request (reusable template phrases are short); longer cached phrases
+# simply aren't matched as sub-spans, which is fine -- they're rarely reusable
+# parts of a different phrase.
+MAX_SPAN = 16
 
 
-async def _longest_prefix(lo: int, hi: int, is_cached: IsCached) -> int:
-    """Largest k in [0, hi-lo] with is_cached(lo, lo+k). Binary search; O(log n)."""
-    best = 0
-    left, right = 1, hi - lo
-    while left <= right:
-        mid = (left + right) // 2
-        if await is_cached(lo, lo + mid):
-            best = mid
-            left = mid + 1
-        else:
-            right = mid - 1
-    return best
+def segment_dp(n: int, cached: set[tuple[int, int]]) -> list[tuple[int, int, bool]]:
+    """Tile [0, n) into cached/synth spans maximizing cached-word coverage.
 
-
-async def _longest_suffix(lo: int, hi: int, is_cached: IsCached) -> int:
-    """Largest k in [0, hi-lo] with is_cached(hi-k, hi). Binary search; O(log n)."""
-    best = 0
-    left, right = 1, hi - lo
-    while left <= right:
-        mid = (left + right) // 2
-        if await is_cached(hi - mid, hi):
-            best = mid
-            left = mid + 1
-        else:
-            right = mid - 1
-    return best
-
-
-async def _segment_range(lo: int, hi: int, is_cached: IsCached, small: int) -> list[tuple[int, int, bool]]:
-    n = hi - lo
+    ``cached`` is the set of (start, end) word-index spans present in the cache.
+    DP right-to-left: at each ``i`` either take a single gap word (coverage
+    ``best[i+1]``) or a cached span ``[i, j)`` in ``cached`` (coverage
+    ``(j-i) + best[j]``), choosing the max; ties prefer the longer cached span
+    (fewer, cleaner pieces). O(n * MAX_SPAN). Consecutive same-type spans are
+    merged on reconstruction.
+    """
     if n <= 0:
         return []
-
-    p = await _longest_prefix(lo, hi, is_cached)
-    s = await _longest_suffix(lo, hi, is_cached)
-
-    if p == 0 and s == 0:
-        # No cached edges -> synthesize this whole span.
-        return [(lo, hi, await is_cached(lo, hi))]
-
-    if p + s >= n:
-        # Prefix and suffix cover/overlap the span; both cached.
-        return [(lo, lo + p, True), (lo + p, hi, True)] if p < n else [(lo, hi, True)]
-
+    best = [0] * (n + 1)                       # best[i] = max cached words in [i, n)
+    choice: list[tuple[int, bool]] = [(i + 1, False) for i in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        best_val = best[i + 1]                 # option A: gap word at i
+        next_end, is_cached_span = i + 1, False
+        hi_max = min(i + MAX_SPAN, n)
+        for j in range(i + 1, hi_max + 1):
+            if (i, j) in cached:
+                cov = (j - i) + best[j]
+                if cov >= best_val:            # ties -> prefer the cached span
+                    best_val = cov
+                    next_end, is_cached_span = j, True
+        best[i] = best_val
+        choice[i] = (next_end, is_cached_span)
     spans: list[tuple[int, int, bool]] = []
-    if p > 0:
-        spans.append((lo, lo + p, True))
-    mid_lo, mid_hi = lo + p, hi - s
-    if mid_hi - mid_lo <= small:
-        # Small middle: synthesize wholesale (or use if cached) rather than
-        # splitting into tiny fragments with poor prosody.
-        spans.append((mid_lo, mid_hi, await is_cached(mid_lo, mid_hi)))
-    else:
-        spans.extend(await _segment_range(mid_lo, mid_hi, is_cached, small))
-    if s > 0:
-        spans.append((hi - s, hi, True))
+    i = 0
+    while i < n:
+        j, c = choice[i]
+        if spans and spans[-1][2] == c:
+            spans[-1] = (spans[-1][0], j, c)   # extend the same-type run
+        else:
+            spans.append((i, j, c))
+        i = j
     return spans
-
-
-async def segment(n: int, is_cached: IsCached, small: int = SMALL) -> list[tuple[int, int, bool]]:
-    """Segment ``words[0:n]`` into cached/synth spans (binary search + recurse)."""
-    return await _segment_range(0, n, is_cached, small)

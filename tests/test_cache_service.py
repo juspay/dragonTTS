@@ -8,6 +8,7 @@ import pytest
 
 from app.cache.service import CacheService
 from app.core.config import settings
+from app.providers.base import AudioResult
 from app.schemas.tts import CartesiaVoice, OutputFormat, TTSRequest
 from app.storage.filesystem import FilesystemBlobStore
 from app.storage.sqlite import SQLiteMetadataStore
@@ -150,6 +151,153 @@ async def test_stitch_skipped_when_coverage_below_gate(svc, fake_provider, monke
     await svc.create(_req_text("hi"))  # only 1 of 5 words cached
     audio, h = await svc.get_or_synthesize(_req_text("hi big unknown phrase here"))
     assert h["X-Cache"] == "MISS"  # full synth, not stitched (coverage 1/5 < 0.5)
+
+
+async def test_stitch_uses_middle_cached_phrase(svc, fake_provider, monkeypatch):
+    """A cached phrase in the MIDDLE of the request is reused. The old binary
+    search only probed cached prefix/suffix edges (needed substring closure to
+    reach a middle span); the DP segmentation finds it directly from an exact
+    whole-phrase cache."""
+    monkeypatch.setattr(settings, "predictive_stitch_enabled", True)
+    await svc.create(_req_text("your order"))  # cached, sits in the middle
+    seed_calls = fake_provider.calls
+    audio, h = await svc.get_or_synthesize(_req_text("hi your order now"))
+    assert h["X-Cache"] == "MISS-STITCH"
+    # only the two gaps ("hi", "now") synthesized; "your order" served from cache
+    assert fake_provider.calls == seed_calls + 2
+    assert len(audio) > 0
+
+
+class _RecordingElevenLabs:
+    """ElevenLabs stand-in: deterministic PCM; records every synth text + count."""
+
+    name = "elevenlabs"
+    native_encoding = "pcm_s16le"
+    native_sample_rate = 16000
+
+    def __init__(self):
+        self._audio = b"\x01\x00" * 400
+        self.calls = 0
+        self.seen: list[str] = []
+
+    async def synth(self, *, text, voice_id, model, language, params) -> AudioResult:
+        self.calls += 1
+        self.seen.append(text)
+        return AudioResult(self._audio, "raw", "pcm_s16le", 16000)
+
+
+async def test_stitch_elevenlabs_dot_keys_match_without_dot(tmp_storage, monkeypatch):
+    """Regression: the cache KEY is dot-free, so a non-prefix cached ElevenLabs
+    phrase is reused by stitch even though the SYNTH text carries the leading
+    dot. An earlier version baked the dot into the key, so the middle cached
+    phrase's stored key ('.your order') never matched the sub-span candidate
+    ('your order') and stitch silently re-synthesized everything.
+
+    Uses the prod config: dot ON, number normalization OFF (the dot is now
+    independent of normalize)."""
+    monkeypatch.setattr(settings, "predictive_stitch_enabled", True)
+    monkeypatch.setattr(settings, "tts_normalize_numbers", False)
+    monkeypatch.setattr(settings, "tts_leading_dot", True)
+
+    prov = _RecordingElevenLabs()
+    meta = SQLiteMetadataStore(settings.db_path)
+    await meta.init()
+    blobs = FilesystemBlobStore(settings.blob_dir)
+    await blobs.init()
+    svc = CacheService(meta, blobs, lambda name: prov if name == "elevenlabs" else None)
+
+    def _req(text: str) -> TTSRequest:
+        return TTSRequest(
+            model_id="elevenlabs:eleven_flash_v2_5", transcript=text,
+            voice=CartesiaVoice(id="v1"), language="en", output_format=OutputFormat(),
+        )
+
+    # Seed the MIDDLE phrase -> cached under a DOT-FREE key, but synthesized
+    # with the ElevenLabs leading dot.
+    await svc.create(_req("your order"))
+    seed_calls = prov.calls
+    assert prov.seen[-1] == ".your order"   # dot reached the provider
+
+    # Full-text MISS: stitch must reuse "your order" (dot-free key match) and
+    # synthesize only the two gaps ("hi", "now") -- not the whole phrase.
+    audio, h = await svc.get_or_synthesize(_req("hi your order now"))
+    assert h["X-Cache"] == "MISS-STITCH"
+    assert prov.calls == seed_calls + 2          # only the gaps synthesized
+    assert len(audio) > 0
+    # The gap synths also carried the dot -> consistent onset/prosody with the
+    # cached clip (the fix for the seam inconsistency the review flagged).
+    assert ".hi" in prov.seen and ".now" in prov.seen
+
+
+async def test_stitch_falls_through_on_blob_eviction(svc, fake_provider, monkeypatch):
+    """A cached span whose blob vanished between the probe and the fetch is
+    synthesized, not raised as a 500. Metadata delete + blob delete aren't atomic
+    across the two stores, so the blob can be missing while the row still reads
+    non-expired."""
+    monkeypatch.setattr(settings, "predictive_stitch_enabled", True)
+    key, *_ = await svc.create(_req_text("your order"))  # cached middle phrase
+    seed_calls = fake_provider.calls
+    rec = await svc._metadata.get(key)
+    # Delete the BLOB but leave the metadata row (the eviction race).
+    (svc._blobs.blob_dir / rec.storage_path).unlink()
+
+    # Must NOT 500: the evicted cached span falls through to a synth.
+    audio, h = await svc.get_or_synthesize(_req_text("hi your order now"))
+    assert h["X-Cache"] == "MISS-STITCH"
+    assert len(audio) > 0
+    # 2 gaps ("hi", "now") + the evicted "your order" span, all synthesized.
+    assert fake_provider.calls == seed_calls + 3
+
+
+# -- ElevenLabs dot decoupling (synth-only, never the key) ------------------
+
+
+async def _eleven_svc(prov) -> CacheService:
+    """CacheService wired to an ElevenLabs provider for dot-decoupling tests."""
+    meta = SQLiteMetadataStore(settings.db_path)
+    await meta.init()
+    blobs = FilesystemBlobStore(settings.blob_dir)
+    await blobs.init()
+    return CacheService(meta, blobs, lambda name: prov if name == "elevenlabs" else None)
+
+
+def _eleven_req(text: str) -> TTSRequest:
+    return TTSRequest(
+        model_id="elevenlabs:eleven_flash_v2_5", transcript=text,
+        voice=CartesiaVoice(id="v1"), language="en", output_format=OutputFormat(),
+    )
+
+
+async def test_dot_toggle_does_not_split_cache_entry(tmp_storage, monkeypatch):
+    """TTS_LEADING_DOT is synth-only: flipping it must NOT change the cache key,
+    so 'your order' stays a single entry whether the dot is on or off."""
+    monkeypatch.setattr(settings, "tts_normalize_numbers", False)
+    prov = _RecordingElevenLabs()
+    svc = await _eleven_svc(prov)
+
+    monkeypatch.setattr(settings, "tts_leading_dot", True)
+    await svc.create(_eleven_req("your order"))     # stored under a dot-free key
+    calls_with_dot = prov.calls
+
+    # Turn the dot OFF and request the SAME phrase -> same key, no re-synth.
+    monkeypatch.setattr(settings, "tts_leading_dot", False)
+    _audio, h = await svc.get_or_synthesize(_eleven_req("your order"))
+    assert h["X-Cache"] == "HIT"
+    assert prov.calls == calls_with_dot              # dot toggle didn't split
+
+
+async def test_dot_reaches_synth_even_with_normalize_off(tmp_storage, monkeypatch):
+    """The dot is INDEPENDENT of number normalization: with normalize OFF and dot
+    ON, ElevenLabs still receives the leading dot (digits left unexpanded)."""
+    monkeypatch.setattr(settings, "tts_normalize_numbers", False)
+    monkeypatch.setattr(settings, "tts_leading_dot", True)
+    prov = _RecordingElevenLabs()
+    svc = await _eleven_svc(prov)
+
+    await svc.get_or_synthesize(_eleven_req("5 hundred 99 rupees"))
+    assert prov.seen, "provider.synth was never called"
+    # dot prepended, but digits NOT expanded (normalize is off)
+    assert prov.seen[-1] == ".5 hundred 99 rupees"
 
 
 async def test_stream_serves_miss_stitch_then_hit(svc, fake_provider, monkeypatch):

@@ -283,6 +283,32 @@ class SQLiteMetadataStore:
         row = await self._run(_q)
         return _row_to_record(row) if row else None
 
+    async def get_many(self, keys) -> dict[str, CacheRecord]:
+        """Return stored records for the given keys (only those present).
+
+        Batched point lookup for stitch's candidate-sub-span probe: one
+        ``key IN (...)`` query instead of N individual ``get``s. Chunked to
+        stay under SQLite's host-parameter limit.
+        """
+        keys = [k for k in dict.fromkeys(keys) if k]  # dedupe, drop empties
+        if not keys:
+            return {}
+        out: dict[str, CacheRecord] = {}
+        for i in range(0, len(keys), 500):
+            chunk = keys[i:i + 500]
+
+            def _q(conn: sqlite3.Connection, chunk=chunk) -> list:
+                placeholders = ",".join("?" for _ in chunk)
+                return conn.execute(
+                    f"SELECT * FROM cache_entries WHERE key IN ({placeholders})", chunk
+                ).fetchall()
+
+            for row in await self._run(_q):
+                rec = _row_to_record(row)
+                if rec:
+                    out[rec.key] = rec
+        return out
+
     async def put(self, record: CacheRecord) -> None:
         values = tuple(getattr(record, c) for c in _COLUMNS)
         placeholders = ",".join("?" for _ in _COLUMNS)

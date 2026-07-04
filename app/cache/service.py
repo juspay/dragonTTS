@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from app.audio.format import convert_audio
-from app.audio.text import normalize_for_tts
+from app.audio.text import normalize_for_tts, prepend_leading_dot
 from app.cache.metrics import WriteBehindMetrics
 from app.cache.resilience import get_gate
 from app.cache.key import (
@@ -34,7 +34,7 @@ from app.cache.key import (
     normalize_text,
     parse_model_id,
 )
-from app.cache.segment import segment
+from app.cache.segment import MAX_SPAN, segment_dp
 from app.core.config import settings
 from app.core.logging import logger
 from app.providers.base import AudioResult, BaseTTSProvider, ProviderError
@@ -263,9 +263,12 @@ class CacheService:
         provider, model = parse_model_id(req.model_id)
         of = req.output_format
         params_canon = canonical_params(provider, req.params)
-        # Expand numbers to words (Indian grouping) for both the synth text and
-        # the key, so "599" and "5 hundred 99" share one cache entry. ElevenLabs
-        # also gets leading-dot handling; other providers read a stray "." fine.
+        # Number-normalize the transcript (Indian grouping) so the cache KEY and
+        # the synth-text base stay in sync -- "599" and "5 hundred 99" share one
+        # entry. This is KEY text: it is provider-hint-free, so the ElevenLabs
+        # leading dot is NOT added here (it's a synth-only hint, applied in
+        # _synthesize / _stream_and_store / warm_split). A dot-free key means
+        # stitch sub-span keys match cached entries naturally.
         req.transcript = normalize_for_tts(req.transcript, provider)
         key = hash_key(
             text=req.transcript,
@@ -321,7 +324,7 @@ class CacheService:
         async with gate:
             t0 = time.perf_counter()
             result = await instance.synth(
-                text=req.transcript,
+                text=prepend_leading_dot(req.transcript, provider),
                 voice_id=req.voice.id,
                 model=model,
                 language=req.language,
@@ -406,45 +409,58 @@ class CacheService:
     # -- read path -----------------------------------------------------------
 
     async def stitch(self, req: TTSRequest, provider: str, model: str, params_canon: str):
-        """Serve a full-text MISS from cached sub-phrases where possible.
+        """Serve a full-text MISS from cached phrases where possible.
 
-        Binary-searches the longest cached prefix/suffix (monotonic under the
-        substring-closed cache), recurses on the middle, synthesizes only the
-        gaps, then cross-fades the pieces together. Returns native
-        ``pcm_s16le@16k`` audio, or ``None`` if stitching isn't worthwhile
-        (disabled, too short, or cached coverage below the gate) so the caller
-        synthesizes the whole phrase.
+        Probes every candidate sub-span of the phrase in ONE batched key lookup,
+        then DP-segments into cached/synth spans maximizing cached coverage and
+        synthesizes only the gaps. No substring-closure assumption, so it works
+        with a whole-phrase cache (the warmer need not pre-split into a
+        sub-phrase lattice). Returns native ``pcm_s16le@16k`` audio, or ``None``
+        if stitching isn't worthwhile (disabled, too short, or cached coverage
+        below the gate) so the caller synthesizes the whole phrase.
         """
         if not settings.predictive_stitch_enabled:
             return None
         words = normalize_text(req.transcript).split()
-        if len(words) < 2:
+        n = len(words)
+        if n < 2:
             return None
 
-        async def is_cached(lo: int, hi: int) -> bool:
-            skey = hash_key(
-                text=" ".join(words[lo:hi]), provider=provider, voice_id=req.voice.id,
-                model=model, language=req.language, params_canonical=params_canon,
-            )
-            rec = await self._metadata.get(skey)
-            return bool(rec and not self._expired(rec))
+        # One batched lookup: generate every candidate (lo, hi) key (hi-lo <=
+        # MAX_SPAN), ask the store in a single query, segment in-memory. No
+        # per-probe round-trips, no closure requirement. Sub-span keys use the
+        # SAME number-only normalization as the stored entries (the dot is a
+        # synth-only hint and is NOT in the key), so any cached sub-span matches
+        # directly -- no dot/closure gymnastics. The gap spans are synthesized
+        # via _synthesize, which applies the ElevenLabs dot, so cached clips and
+        # synthesized gaps share identical onset/prosody.
+        key_to_span: dict[str, tuple[int, int]] = {}
+        for lo in range(n):
+            for hi in range(lo + 1, min(lo + MAX_SPAN, n) + 1):
+                sub_text = normalize_for_tts(" ".join(words[lo:hi]), provider)
+                key_to_span[hash_key(
+                    text=sub_text, provider=provider, voice_id=req.voice.id,
+                    model=model, language=req.language, params_canonical=params_canon,
+                )] = (lo, hi)
+        records = await self._metadata.get_many(key_to_span.keys())
+        span_record = {  # (lo, hi) -> record, only non-expired
+            key_to_span[k]: r for k, r in records.items() if not self._expired(r)
+        }
 
-        spans = await segment(len(words), is_cached)
+        spans = segment_dp(n, set(span_record))
         cached_words = sum(hi - lo for lo, hi, c in spans if c)
-        if cached_words == 0 or cached_words / len(words) < settings.predictive_stitch_min_coverage:
+        if cached_words == 0 or cached_words / n < settings.predictive_stitch_min_coverage:
             return None  # not enough cached -> let the caller synth the whole phrase
 
         async def span_audio(lo: int, hi: int, c: bool) -> bytes:
-            sub_text = " ".join(words[lo:hi])
             if c:
-                skey = hash_key(
-                    text=sub_text, provider=provider, voice_id=req.voice.id,
-                    model=model, language=req.language, params_canonical=params_canon,
-                )
-                rec = await self._metadata.get(skey)
-                if rec and not self._expired(rec):
-                    return await self._blobs.get(rec.storage_path)
-                # evicted between probe and fetch -> fall through to synth
+                rec = span_record.get((lo, hi))
+                if rec:  # non-expired (filtered above); reuse its clip
+                    try:
+                        return await self._blobs.get(rec.storage_path)
+                    except FileNotFoundError:
+                        pass  # evicted between probe and fetch -> synth this span
+            sub_text = " ".join(words[lo:hi])
             sub_req = TTSRequest(
                 model_id=req.model_id, transcript=sub_text, voice=req.voice,
                 language=req.language, output_format=req.output_format, params=req.params,
@@ -453,7 +469,7 @@ class CacheService:
             return native.audio
 
         pieces = await asyncio.gather(*(span_audio(lo, hi, c) for (lo, hi, c) in spans))
-        gap_words = len(words) - cached_words
+        gap_words = n - cached_words
         await self._metrics.record_metrics(
             provider=provider,
             words_synthesized=gap_words,
@@ -462,8 +478,8 @@ class CacheService:
             stitch_words_synthesized=gap_words,
         )
         logger.info(
-            f"STITCH key=… provider={provider} words={len(words)} "
-            f"spans={len(spans)} coverage={cached_words}/{len(words)}"
+            f"STITCH key=… provider={provider} words={n} "
+            f"spans={len(spans)} coverage={cached_words}/{n}"
         )
         return await asyncio.to_thread(_stitch_clips, pieces)
 
@@ -753,7 +769,7 @@ class CacheService:
         completed = False
         gate = get_gate(provider)
         gen = instance.stream_synth(
-            text=req.transcript,
+            text=prepend_leading_dot(req.transcript, provider),
             voice_id=req.voice.id,
             model=model,
             language=req.language,
@@ -951,7 +967,8 @@ class CacheService:
         try:
             async with gate:
                 audio, cwords, starts = await instance.synth_with_timestamps(
-                    text=req.transcript, voice_id=req.voice.id, model=model,
+                    text=prepend_leading_dot(req.transcript, provider),
+                    voice_id=req.voice.id, model=model,
                     language=req.language, params=req.params,
                 )
             aligned = bool(cwords) and len(cwords) == len(norm_words)

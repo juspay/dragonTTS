@@ -5,7 +5,13 @@ from __future__ import annotations
 
 import pytest
 
-from app.audio.text import _expand_number, normalize_for_tts, normalize_numbers, num_to_words
+from app.audio.text import (
+    _expand_number,
+    normalize_for_tts,
+    normalize_numbers,
+    num_to_words,
+    prepend_leading_dot,
+)
 from app.cache.service import CacheService
 from app.core.config import settings
 from app.providers.base import AudioResult
@@ -75,7 +81,7 @@ def test_leaves_words_and_trailing_punct():
     assert normalize_numbers("Pack of 2") == "Pack of two"
 
 
-# --- normalize_for_tts gating --------------------------------------------
+# --- normalize_for_tts: number normalization for the cache KEY (no dot) -----
 
 
 def test_for_tts_disabled_is_noop(monkeypatch):
@@ -83,31 +89,71 @@ def test_for_tts_disabled_is_noop(monkeypatch):
     assert normalize_for_tts("5 hundred 99", "elevenlabs") == "5 hundred 99"
 
 
-def test_for_tts_elevenlabs_prepends_dot(monkeypatch):
+def test_for_tts_is_number_only_never_dots(monkeypatch):
+    """normalize_for_tts is KEY text: number expansion only. The ElevenLabs dot
+    is a synth-only hint (prepend_leading_dot) and must NOT be baked into the
+    key, else "your order" and ".your order" get separate entries."""
     monkeypatch.setattr(settings, "tts_normalize_numbers", True)
     monkeypatch.setattr(settings, "tts_leading_dot", True)
-    # no leading dot -> prepend (numbers expanded too)
-    assert normalize_for_tts("hello bro", "elevenlabs") == ".hello bro"
-    assert normalize_for_tts("5 hundred", "elevenlabs") == ".five hundred"
-    # already starts with "." -> no change (no double dot)
-    assert normalize_for_tts(".5 hundred", "elevenlabs") == ".five hundred"
-    assert normalize_for_tts(".abc", "elevenlabs") == ".abc"
-
-
-def test_for_tts_elevenlabs_dot_off_is_noop(monkeypatch):
-    monkeypatch.setattr(settings, "tts_normalize_numbers", True)
-    monkeypatch.setattr(settings, "tts_leading_dot", False)
-    # dot off -> no prepend, but numbers still expand
+    # elevenlabs: numbers expand, but NO leading dot
+    assert normalize_for_tts("hello bro", "elevenlabs") == "hello bro"
     assert normalize_for_tts("5 hundred", "elevenlabs") == "five hundred"
-    assert normalize_for_tts(".abc", "elevenlabs") == ".abc"
+    # an input leading "." on a number token is preserved by normalize_numbers,
+    # but no EXTRA dot is ever prepended by normalize_for_tts
+    assert normalize_for_tts(".5 hundred", "elevenlabs") == ".five hundred"
 
 
-def test_for_tts_cartesia_never_prepends(monkeypatch):
+def test_for_tts_cartesia_is_number_only(monkeypatch):
     monkeypatch.setattr(settings, "tts_normalize_numbers", True)
     monkeypatch.setattr(settings, "tts_leading_dot", True)
-    # cartesia/sarvam unaffected even when the dot is enabled
     assert normalize_for_tts("hello bro", "cartesia") == "hello bro"
     assert normalize_for_tts("5 hundred", "cartesia") == "five hundred"
+
+
+# --- prepend_leading_dot: ElevenLabs SYNTH-only hint (never the key) --------
+
+
+def test_prepend_dot_elevenlabs(monkeypatch):
+    monkeypatch.setattr(settings, "tts_normalize_numbers", True)
+    monkeypatch.setattr(settings, "tts_leading_dot", True)
+    assert prepend_leading_dot("hello bro", "elevenlabs") == ".hello bro"
+    assert prepend_leading_dot("five hundred", "elevenlabs") == ".five hundred"
+    # already starts with "." -> no double dot (idempotent)
+    assert prepend_leading_dot(".five hundred", "elevenlabs") == ".five hundred"
+    assert prepend_leading_dot(".abc", "elevenlabs") == ".abc"
+
+
+def test_prepend_dot_off_is_noop(monkeypatch):
+    monkeypatch.setattr(settings, "tts_normalize_numbers", True)
+    monkeypatch.setattr(settings, "tts_leading_dot", False)
+    assert prepend_leading_dot("hello bro", "elevenlabs") == "hello bro"
+    assert prepend_leading_dot("five hundred", "elevenlabs") == "five hundred"
+
+
+def test_prepend_dot_independent_of_normalize(monkeypatch):
+    # the dot is independent of number expansion: it applies even when normalize
+    # is off (so turning TTS_NORMALIZE_NUMBERS off never silently kills the dot).
+    monkeypatch.setattr(settings, "tts_normalize_numbers", False)
+    monkeypatch.setattr(settings, "tts_leading_dot", True)
+    assert prepend_leading_dot("hello bro", "elevenlabs") == ".hello bro"
+
+
+def test_prepend_dot_cartesia_unaffected(monkeypatch):
+    monkeypatch.setattr(settings, "tts_normalize_numbers", True)
+    monkeypatch.setattr(settings, "tts_leading_dot", True)
+    assert prepend_leading_dot("hello bro", "cartesia") == "hello bro"
+    assert prepend_leading_dot("five hundred", "cartesia") == "five hundred"
+
+
+def test_prepend_dot_empty_and_case_insensitive(monkeypatch):
+    monkeypatch.setattr(settings, "tts_normalize_numbers", True)
+    monkeypatch.setattr(settings, "tts_leading_dot", True)
+    # must NOT turn empty/whitespace into a bare "."
+    assert prepend_leading_dot("", "elevenlabs") == ""
+    assert prepend_leading_dot("   ", "elevenlabs") == "   "
+    # provider match is case- / whitespace-insensitive
+    assert prepend_leading_dot("hello", "ElevenLabs") == ".hello"
+    assert prepend_leading_dot("hello", " elevenlabs ") == ".hello"
 
 
 # --- end-to-end: normalization collapses cache keys -----------------------
@@ -157,17 +203,23 @@ def test_normalize_for_tts_idempotent():
             assert once == twice, f"not idempotent: {text!r}/{provider} -> {once!r} -> {twice!r}"
 
 
-def test_elevenlabs_empty_transcript_gets_no_dot(monkeypatch):
+def test_elevenlabs_empty_transcript_gets_no_bare_dot(monkeypatch):
     monkeypatch.setattr(settings, "tts_normalize_numbers", True)
-    # must NOT synthesize a bare "."
+    # neither function may turn empty/whitespace into a bare "."
     assert normalize_for_tts("", "elevenlabs") == ""
     assert normalize_for_tts("   ", "elevenlabs") == ""
+    assert prepend_leading_dot("", "elevenlabs") == ""
+    assert prepend_leading_dot("   ", "elevenlabs") == "   "
 
 
-def test_provider_match_is_case_insensitive(monkeypatch):
+def test_key_is_dot_free_regardless_of_provider_case(monkeypatch):
+    """The cache key text must NEVER carry the ElevenLabs dot (it's synth-only),
+    no matter how the provider name is cased."""
     monkeypatch.setattr(settings, "tts_normalize_numbers", True)
-    assert normalize_for_tts("hello", "ElevenLabs") == ".hello"
-    assert normalize_for_tts("hello", " elevenlabs ") == ".hello"
+    monkeypatch.setattr(settings, "tts_leading_dot", True)
+    assert normalize_for_tts("hello", "ElevenLabs") == "hello"
+    assert normalize_for_tts("hello", " elevenlabs ") == "hello"
+    assert normalize_for_tts("5 hundred", "ELEVENLABS") == "five hundred"
 
 
 class _RecordingProvider:

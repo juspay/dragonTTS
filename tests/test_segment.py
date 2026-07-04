@@ -1,83 +1,117 @@
-"""Binary-search segmentation — pure logic with a fake async is_cached."""
+"""DP segmentation — pure logic with an exact cached-span set (no closure)."""
 
 from __future__ import annotations
 
-import pytest
-
-from app.cache.segment import segment
+from app.cache.segment import MAX_SPAN, segment_dp
 
 
-def _make_is_cached(full_phrases: set[tuple[int, int]]):
-    """Closure-aware is_cached(start, end): True if [start,end) is a contiguous
-    sub-range of any cached full phrase — mirrors warm_split's substring closure."""
-    async def is_cached(start: int, end: int) -> bool:
-        return any(cl <= start and end <= ch for (cl, ch) in full_phrases)
-    return is_cached
-
-
-async def _seg(n, cached, **kw):
-    return await segment(n, _make_is_cached(cached), **kw)
-
-
-async def test_prefix_suffix_with_synth_middle():
+def test_prefix_suffix_with_synth_middle():
     # words: [hi, nitya, sir]; cached: hi(0,1), sir(2,3). Middle "nitya" synth'd.
-    segs = await _seg(3, {(0, 1), (2, 3)})
-    assert segs == [(0, 1, True), (1, 2, False), (2, 3, True)]
+    assert segment_dp(3, {(0, 1), (2, 3)}) == [(0, 1, True), (1, 2, False), (2, 3, True)]
 
 
-async def test_nothing_cached_synths_whole():
-    segs = await _seg(4, set())
-    assert segs == [(0, 4, False)]
+def test_nothing_cached_synths_whole():
+    assert segment_dp(4, set()) == [(0, 4, False)]
 
 
-async def test_whole_cached():
-    segs = await _seg(5, {(0, 5)})
+def test_whole_cached():
+    assert segment_dp(5, {(0, 5)}) == [(0, 5, True)]
+
+
+def test_longest_prefix_without_closure_chain():
+    # Only the 3-word prefix is cached -- NO need for the (0,1),(0,2) closure
+    # chain the old binary search required. DP picks the longest cached span.
+    assert segment_dp(5, {(0, 3)}) == [(0, 3, True), (3, 5, False)]
+
+
+def test_middle_cached_span_found():
+    # A cached span in the MIDDLE (not a prefix/suffix) is reused. The old
+    # binary search needed substring closure to reach this; DP finds it directly
+    # from an exact whole-phrase cache.
+    # words: [hi, <name>, your, order]; cached: hi(0,1), your order(2,4)
+    assert segment_dp(4, {(0, 1), (2, 4)}) == [(0, 1, True), (1, 2, False), (2, 4, True)]
+
+
+def test_prefix_and_suffix_meet():
+    # Adjacent cached spans tile [0,5) with no gap -> merged into one cached span.
+    # (The old binary search "covered" [3,5) via an overlapping suffix under
+    # closure; exact-match DP needs the span itself cached — adjacent, not
+    # overlapping — which is the honest, no-slicing behavior.)
+    cached = {(0, 3), (3, 5)}
+    segs = segment_dp(5, cached)
     assert segs == [(0, 5, True)]
 
 
-async def test_long_prefix():
-    # words: [a, b, c, d, e]; cached prefixes a, ab, abc (closure). Prefix=3.
-    cached = {(0, 1), (0, 2), (0, 3)}
-    segs = await _seg(5, cached)
-    # prefix 3, no suffix -> middle [3,5] (2 words <= SMALL) synth'd whole
-    assert (0, 3, True) in segs
-    # remainder is one synth span covering [3,5]
-    synth = [s for s in segs if not s[2]]
-    assert synth == [(3, 5, False)]
+def test_consecutive_same_type_merged():
+    assert segment_dp(4, {(0, 2), (2, 4)}) == [(0, 4, True)]   # adjacent cached -> one
+    assert segment_dp(3, {(0, 1)}) == [(0, 1, True), (1, 3, False)]  # adjacent gaps -> one
 
 
-async def test_prefix_and_suffix_meet():
-    # cached: prefix(0,3) and suffix(2,5) overlap -> whole covered
-    cached = {(0, 1), (0, 2), (0, 3), (2, 5), (3, 5), (4, 5)}
-    segs = await _seg(5, cached)
-    # all spans cached
-    assert all(c for _, _, c in segs)
-    # spans tile [0,5]
-    pos = 0
-    for a, b, _ in segs:
-        assert a == pos
-        pos = b
-    assert pos == 5
+def test_prefers_longer_cached_span_on_ties():
+    segs = segment_dp(5, {(0, 2), (0, 3)})
+    assert [(a, b) for a, b, c in segs if c] == [(0, 3)]   # picks the longer span
 
 
-async def test_binary_search_uses_monotonicity():
-    # Closure: cached(0,k) for k<=3, not for k>3. Binary search must find 3.
-    cached = {(0, 1), (0, 2), (0, 3)}
-    segs = await _seg(6, cached)
-    cached_prefix = max((b for a, b, c in segs if c and a == 0), default=0)
-    assert cached_prefix == 3
+def test_personalized_template_split():
+    # The motivating case: cached "Hi" + cached template; the name is the gap.
+    # words: [Hi, Anarjit, your, order, is, six, hundred, ninety, nine]
+    cached = {(0, 1), (2, 9)}              # "Hi" + "your order is ... ninety nine"
+    segs = segment_dp(9, cached)
+    assert segs == [(0, 1, True), (1, 2, False), (2, 9, True)]
+    assert sum(hi - lo for lo, hi, c in segs if not c) == 1   # only the name synth'd
 
 
-async def test_small_middle_not_split_further():
-    # Big prefix, tiny 2-word middle with one cached word -> middle synth'd whole
-    # (small threshold prevents splitting the 2-word middle into word fragments).
-    cached = {(0, 1), (0, 2), (0, 3), (5, 6)}  # prefix 3, suffix 1, mid=[3,5]
-    segs = await _seg(6, cached)
-    spans = [(a, b, c) for a, b, c in segs]
-    # prefix(0,3,T), middle(3,5,F) [not split despite word 5 boundary], suffix(5,6,T)
-    assert (0, 3, True) in spans
-    assert (5, 6, True) in spans
-    assert (3, 5, False) in spans
-    # No fragment inside the middle:
-    assert (3, 4, False) not in spans
-    assert (4, 5, False) not in spans
+# --- edge cases ----------------------------------------------------------
+
+
+def test_n_zero_and_one():
+    assert segment_dp(0, set()) == []
+    assert segment_dp(1, set()) == [(0, 1, False)]
+    assert segment_dp(1, {(0, 1)}) == [(0, 1, True)]
+
+
+def test_max_span_boundary():
+    # a cached span of EXACTLY MAX_SPAN words is reused; one word longer is not
+    # (the candidate j-range is capped at i+MAX_SPAN). Stitch checks the whole
+    # phrase separately, so dropping a >MAX_SPAN span here is by design.
+    assert segment_dp(MAX_SPAN, {(0, MAX_SPAN)}) == [(0, MAX_SPAN, True)]
+    big = MAX_SPAN + 1
+    segs = segment_dp(big, {(0, big)})
+    assert all(not c for _, _, c in segs)                      # nothing reused
+    assert sum(hi - lo for lo, hi, _ in segs) == big           # still a full tiling
+
+
+def test_out_of_range_spans_are_ignored():
+    # spans ending past n (or before 0) never match the candidate range and are
+    # silently dropped, not crashed on.
+    assert segment_dp(4, {(2, 5)}) == [(0, 4, False)]          # j=5 > n=4
+    assert segment_dp(4, {(-1, 2)}) == [(0, 4, False)]         # i=-1 < 0
+
+
+def test_all_cached_adjacent_merges_into_one():
+    n = 6
+    cached = {(i, i + 2) for i in range(0, n, 2)}  # (0,2),(2,4),(4,6)
+    assert segment_dp(n, cached) == [(0, n, True)]
+
+
+def test_single_word_gap_between_cached_stays_separate():
+    # a 1-word gap wedged between two cached spans is its own span -- never
+    # merged into a cached span (the merge only coalesces same-type neighbors).
+    assert segment_dp(5, {(0, 2), (3, 5)}) == [
+        (0, 2, True), (2, 3, False), (3, 5, True),
+    ]
+
+
+def test_tiling_is_gapless_and_non_overlapping():
+    # every reconstruction must partition [0,n) exactly once.
+    for n in range(0, 25):
+        for cached in (set(), {(0, n)}, {(0, 1), (n - 1, n)} if n > 1 else set()):
+            segs = segment_dp(n, cached)
+            covered = sum(hi - lo for lo, hi, _ in segs)
+            assert covered == n, f"n={n} cached={cached} -> {segs}"
+            # spans are contiguous and ordered
+            pos = 0
+            for lo, hi, _ in segs:
+                assert lo == pos and hi > lo
+                pos = hi
+            assert pos == n

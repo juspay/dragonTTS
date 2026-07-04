@@ -45,11 +45,16 @@ spec:
               value: "true"
             # --- TTS text normalization ---
             # Expand numbers to words (Indian: lakh/crore) before synth AND in the
-            # cache key, so ElevenLabs reads "5 hundred 99" correctly and "599"
-            # collapses to the same entry. Clear the cache after toggling.
+            # Number normalization is OFF by default (not needed yet). When on it
+            # expands digits to words in the synth text + cache key, so ElevenLabs
+            # reads "5 hundred 99" correctly and "599" collapses to one entry.
+            # Clear the cache after toggling. NOTE: the ElevenLabs leading dot
+            # (TTS_LEADING_DOT) is INDEPENDENT of this and stays on below.
             - name: TTS_NORMALIZE_NUMBERS
-              value: "true"
+              value: "false"
             # ElevenLabs only: prepend a leading "." if missing (true/false).
+            # Independent of TTS_NORMALIZE_NUMBERS — the dot applies even when
+            # number normalization is off.
             - name: TTS_LEADING_DOT
               value: "true"
             # --- Performance ---
