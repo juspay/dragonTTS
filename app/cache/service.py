@@ -97,6 +97,21 @@ def _to_int16(x: np.ndarray) -> bytes:
     return (np.clip(x, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
 
 
+def _prep_clip(p: bytes) -> np.ndarray:
+    """Per-clip stitch prep: float -> silence-trim -> DC-remove -> RMS-normalize.
+
+    Each clip is normalized to the SAME fixed target (-20 dBFS) independently, so
+    a clip prepped and emitted early (progressive path) is loudness-consistent
+    with one prepped later in the same run. Extracted from _stitch_clips so the
+    assemble path and the streaming path prepare clips identically.
+    """
+    x = _to_float(p)
+    x = _trim_edges(x, head=True, tail=True)  # trim silence on the raw signal first
+    x = x - float(np.mean(x))                  # DC removal over the voiced part
+    x = _rms_normalize(x)
+    return x
+
+
 def _rms_normalize(x: np.ndarray) -> np.ndarray:
     """Scale so the clip's RMS hits the target loudness; leave near-silent clips."""
     rms = float(np.sqrt(np.mean(x * x))) + 1e-12
@@ -169,13 +184,7 @@ def _stitch_clips(pieces: list[bytes]) -> bytes:
     """
     if not pieces:
         return b""
-    clips: list[np.ndarray] = []
-    for p in pieces:
-        x = _to_float(p)
-        x = _trim_edges(x, head=True, tail=True)  # trim silence on the raw signal first
-        x = x - float(np.mean(x))                  # DC removal over the voiced part
-        x = _rms_normalize(x)
-        clips.append(x)
+    clips: list[np.ndarray] = [_prep_clip(p) for p in pieces]
     if len(clips) == 1:
         return _to_int16(clips[0])
     out = clips[0]
@@ -408,16 +417,16 @@ class CacheService:
 
     # -- read path -----------------------------------------------------------
 
-    async def stitch(self, req: TTSRequest, provider: str, model: str, params_canon: str):
-        """Serve a full-text MISS from cached phrases where possible.
+    async def _stitch_plan(
+        self, req: TTSRequest, provider: str, model: str, params_canon: str,
+    ):
+        """Shared span planning for :meth:`stitch` and the pass-through stream path.
 
-        Probes every candidate sub-span of the phrase in ONE batched key lookup,
-        then DP-segments into cached/synth spans maximizing cached coverage and
-        synthesizes only the gaps. No substring-closure assumption, so it works
-        with a whole-phrase cache (the warmer need not pre-split into a
-        sub-phrase lattice). Returns native ``pcm_s16le@16k`` audio, or ``None``
-        if stitching isn't worthwhile (disabled, too short, or cached coverage
-        below the gate) so the caller synthesizes the whole phrase.
+        Returns ``(spans, span_record, words, n)`` or ``None`` if stitching isn't
+        worthwhile (disabled, <2 words, or cached coverage below the gate).
+        ``spans`` tiles ``[0,n)`` as ``(lo, hi, is_cached)``; ``span_record`` maps
+        a cached ``(lo,hi)`` to its non-expired record. Pure extraction of
+        ``stitch``'s head -- identical behavior (existing tests are the safety net).
         """
         if not settings.predictive_stitch_enabled:
             return None
@@ -425,15 +434,11 @@ class CacheService:
         n = len(words)
         if n < 2:
             return None
-
-        # One batched lookup: generate every candidate (lo, hi) key (hi-lo <=
-        # MAX_SPAN), ask the store in a single query, segment in-memory. No
-        # per-probe round-trips, no closure requirement. Sub-span keys use the
-        # SAME number-only normalization as the stored entries (the dot is a
-        # synth-only hint and is NOT in the key), so any cached sub-span matches
-        # directly -- no dot/closure gymnastics. The gap spans are synthesized
-        # via _synthesize, which applies the ElevenLabs dot, so cached clips and
-        # synthesized gaps share identical onset/prosody.
+        # One batched lookup: every candidate (lo, hi) key (hi-lo <= MAX_SPAN).
+        # Sub-span keys use the SAME number-only normalization as the stored
+        # entries (the dot is a synth-only hint, NOT in the key), so any cached
+        # sub-span matches directly. Gap spans synth via _synthesize, which
+        # applies the ElevenLabs dot, so cached + gap clips share onset/prosody.
         key_to_span: dict[str, tuple[int, int]] = {}
         for lo in range(n):
             for hi in range(lo + 1, min(lo + MAX_SPAN, n) + 1):
@@ -446,29 +451,68 @@ class CacheService:
         span_record = {  # (lo, hi) -> record, only non-expired
             key_to_span[k]: r for k, r in records.items() if not self._expired(r)
         }
-
         spans = segment_dp(n, set(span_record))
         cached_words = sum(hi - lo for lo, hi, c in spans if c)
         if cached_words == 0 or cached_words / n < settings.predictive_stitch_min_coverage:
-            return None  # not enough cached -> let the caller synth the whole phrase
+            return None  # not enough cached -> caller should synth the whole phrase
+        return spans, span_record, words, n
 
-        async def span_audio(lo: int, hi: int, c: bool) -> bytes:
-            if c:
-                rec = span_record.get((lo, hi))
-                if rec:  # non-expired (filtered above); reuse its clip
-                    try:
-                        return await self._blobs.get(rec.storage_path)
-                    except FileNotFoundError:
-                        pass  # evicted between probe and fetch -> synth this span
-            sub_text = " ".join(words[lo:hi])
-            sub_req = TTSRequest(
-                model_id=req.model_id, transcript=sub_text, voice=req.voice,
-                language=req.language, output_format=req.output_format, params=req.params,
-            )
-            native = await self._synthesize(sub_req, provider, model)
-            return native.audio
+    async def _span_bytes(
+        self, lo: int, hi: int, c: bool, span_record, req: TTSRequest,
+        provider: str, model: str, words: list[str],
+    ) -> bytes:
+        """Raw native pcm bytes for one span: cached blob (with eviction
+        fallthrough) or synthesized gap. Shared by :meth:`stitch` and the
+        progressive stream path."""
+        if c:
+            rec = span_record.get((lo, hi))
+            if rec:  # non-expired (filtered in _stitch_plan); reuse its clip
+                try:
+                    return await self._blobs.get(rec.storage_path)
+                except FileNotFoundError:
+                    pass  # evicted between probe and fetch -> synth this span
+        return await self._synth_span(req, provider, model, words, lo, hi)
 
-        pieces = await asyncio.gather(*(span_audio(lo, hi, c) for (lo, hi, c) in spans))
+    async def _synth_span(
+        self, req: TTSRequest, provider: str, model: str, words: list[str],
+        lo: int, hi: int,
+    ) -> bytes:
+        """Synthesize one gap span (``words[lo:hi]``) to native pcm and return it."""
+        sub_req = TTSRequest(
+            model_id=req.model_id, transcript=" ".join(words[lo:hi]), voice=req.voice,
+            language=req.language, output_format=req.output_format, params=req.params,
+        )
+        native = await self._synthesize(sub_req, provider, model)
+        return native.audio
+
+    async def stitch(
+        self, req: TTSRequest, provider: str, model: str, params_canon: str, plan=None,
+    ):
+        """Serve a full-text MISS from cached phrases where possible.
+
+        Probes every candidate sub-span of the phrase in ONE batched key lookup,
+        then DP-segments into cached/synth spans maximizing cached coverage and
+        synthesizes only the gaps. No substring-closure assumption, so it works
+        with a whole-phrase cache (the warmer need not pre-split into a
+        sub-phrase lattice). Returns native ``pcm_s16le@16k`` audio, or ``None``
+        if stitching isn't worthwhile (disabled, too short, or cached coverage
+        below the gate) so the caller synthesizes the whole phrase.
+
+        ``plan`` optionally carries a precomputed ``_stitch_plan`` result so a
+        caller that already ran the plan (e.g. the pass-through eligibility check)
+        can fall back here without re-running the batched lookup + DP a 2nd time.
+        """
+        if plan is None:
+            plan = await self._stitch_plan(req, provider, model, params_canon)
+        if plan is None:
+            return None
+        spans, span_record, words, n = plan
+
+        pieces = await asyncio.gather(*(
+            self._span_bytes(lo, hi, c, span_record, req, provider, model, words)
+            for (lo, hi, c) in spans
+        ))
+        cached_words = sum(hi - lo for lo, hi, c in spans if c)
         gap_words = n - cached_words
         await self._metrics.record_metrics(
             provider=provider,
@@ -482,6 +526,155 @@ class CacheService:
             f"spans={len(spans)} coverage={cached_words}/{n}"
         )
         return await asyncio.to_thread(_stitch_clips, pieces)
+
+    async def _progressive_stitch_stream(
+        self,
+        req: TTSRequest,
+        provider: str,
+        model: str,
+        params_canon: str,
+        key: str,
+        record,
+        spans: list[tuple[int, int, bool]],
+        span_record: dict,
+        words: list[str],
+        n: int,
+    ) -> AsyncGenerator[bytes, None]:
+        """Stream a stitch MISS progressively: emit the cached PREFIX immediately
+        (TTFB ~0) while the gaps synthesize, holding only the ~xfade window per seam.
+
+        Cached spans are fetched (fast local-FS read) and emitted up front; every
+        GAP synth is kicked off concurrently up front (like assemble's gather), so
+        total ~= max(gap) -- not the sum of gaps -- while the prefix still streams
+        first. Seams reuse ``_prep_clip`` + ``_snap_zero`` + ``_equal_power_xfade``
+        (fixed-target RMS via ``_prep_clip`` keeps loudness consistent across
+        early-emitted and later clips). On clean completion the assembled clip is
+        stored (if write-through) so repeats HIT; pending gap synths are cancelled
+        on disconnect / early break so no provider call outlives the stream.
+        ``key`` is passed in -- never re-resolved (re-normalizing an already-
+        normalized transcript would re-hash).
+        """
+        xfade_n = int(_SR * _XFADE_MS / 1000)
+        accumulated = bytearray()          # assembled native pcm, for store-on-complete
+        out: np.ndarray | None = None      # held tail from the previous clip
+        last_idx = len(spans) - 1
+        completed = False
+        synth_done = 0                      # gap synths that actually completed
+        synth_words_done = 0               # words in those completed gaps
+
+        async def emit(buf: np.ndarray) -> AsyncGenerator[bytes, None]:
+            payload = _to_int16(buf)
+            accumulated.extend(payload)
+            async for chunk in _chunked(payload):
+                yield chunk
+
+        # Kick off every GAP synth concurrently up front. Cached spans are fetched
+        # inline (fast local-FS reads); only gaps need prefetching. Gaps run in
+        # parallel (like assemble's gather) -> total ~= max(gap), while the cached
+        # prefix still streams first (TTFB ~0).
+        gap_tasks: dict[int, asyncio.Task] = {
+            idx: asyncio.create_task(
+                self._span_bytes(lo, hi, False, span_record, req, provider, model, words)
+            )
+            for idx, (lo, hi, c) in enumerate(spans) if not c
+        }
+
+        try:
+            for idx, (lo, hi, c) in enumerate(spans):
+                # Cached span = fast local-FS read; a gap = await its already-running
+                # concurrent task (after earlier prefix bytes were yielded). A failure
+                # mid-stream (headers/prefix committed) can't become a clean 500, so
+                # stop gracefully and credit only synth work that actually finished.
+                try:
+                    if c:
+                        raw = await self._span_bytes(lo, hi, c, span_record, req, provider, model, words)
+                    else:
+                        raw = await gap_tasks[idx]
+                except Exception as e:
+                    logger.warning(
+                        f"pass-through stitch span ({lo}:{hi} cached={c}) failed: "
+                        f"{e}; truncating stream at prefix"
+                    )
+                    break
+                if not c:  # a gap span that synthesized successfully
+                    synth_done += 1
+                    synth_words_done += hi - lo
+
+                clip = _prep_clip(raw)
+
+                if out is None:
+                    # First span: emit everything except the held xfade tail.
+                    if idx == last_idx:
+                        async for chunk in emit(clip):
+                            yield chunk
+                        out = None
+                    else:
+                        hold = min(xfade_n, len(clip))
+                        emit_len = max(0, len(clip) - hold)
+                        if emit_len:
+                            async for chunk in emit(clip[:emit_len]):
+                                yield chunk
+                        out = clip[emit_len:]   # held tail (empty when hold == 0)
+                    continue
+
+                # Subsequent span: splice the held tail into this clip via xfade.
+                out = out[: _snap_zero(out, "tail")]
+                nxt = clip[_snap_zero(clip, "head"):]
+                joined = _equal_power_xfade(out, nxt)
+
+                if idx == last_idx:
+                    async for chunk in emit(joined):
+                        yield chunk
+                    out = None
+                else:
+                    hold = min(xfade_n, len(joined))
+                    emit_len = max(0, len(joined) - hold)
+                    if emit_len:
+                        async for chunk in emit(joined[:emit_len]):
+                            yield chunk
+                    out = joined[emit_len:]
+            else:
+                completed = True  # loop ran to completion (no break / no exception)
+        finally:
+            # Cancel any gap synth still running (disconnect / early break) so no
+            # provider call outlives the stream, and retrieve exceptions so asyncio
+            # doesn't warn about unretrieved task exceptions.
+            for _t in gap_tasks.values():
+                if not _t.done():
+                    _t.cancel()
+                elif not _t.cancelled():
+                    _t.exception()
+
+            # Count the request/miss always (it happened); cache ONLY a cleanly-
+            # completed assembled clip (no half clips on disconnect/error -- matches
+            # _stream_and_store's partial-consumption invariant); and credit synth
+            # work only for gaps that actually finished (so a disconnect/failed gap
+            # doesn't inflate synth_calls/words_synthesized).
+            audio = bytes(accumulated)
+            cached_words = sum(hi - lo for lo, hi, c in spans if c)
+            if completed and settings.enable_write_through and audio:
+                try:
+                    await self._store(
+                        key, req, provider, model, params_canon,
+                        audio, "pcm_s16le", 16000, existing=record,
+                    )
+                except Exception as e:
+                    logger.warning(f"pass-through stitch store failed: {e}")
+            await self._metrics.record_metrics(
+                provider=provider,
+                requests=1, misses=1, bytes_served=len(audio),
+                synth_calls=synth_done,
+                words_served=_wc(req.transcript), words_synthesized=synth_words_done,
+                stitch_calls=1, stitch_words_assembled=cached_words,
+                stitch_words_synthesized=synth_words_done,
+            )
+            self._misses += 1
+            logger.info(
+                f"CACHE MISS-STITCH-PASSTHROUGH (stream) key={key[:12]}… "
+                f"provider={provider} words={n} coverage={cached_words}/{n} "
+                f"synth={synth_done} "
+                f"stored={'yes' if (completed and settings.enable_write_through and audio) else 'no'}"
+            )
 
     async def _produce(
         self, req: TTSRequest, provider: str, model: str, params_canon: str,
@@ -668,7 +861,45 @@ class CacheService:
         # this waits for the gaps to synth before first byte — but the assembled
         # clip is then cached, so repeats are instant HITs.
         if settings.predictive_stitch_stream_enabled:
-            stitched = await self.stitch(req, provider, model, params_canon)
+            plan = None  # computed by the pass-through check; reused by the assemble fallback
+            # --- Progressive pass-through (opt-in): stream the cached prefix
+            # immediately while the first gap synthesizes (TTFB ~0). Falls back
+            # to the assemble path below on any ineligibility/error, so this is
+            # purely additive -- when ENABLE_PASS_THROUGH_STITCH is false the
+            # block below runs unchanged. ---
+            if settings.enable_pass_through_stitch and _same_format(
+                of.encoding, of.sample_rate, "pcm_s16le", 16000
+            ):
+                try:
+                    plan = await self._stitch_plan(req, provider, model, params_canon)
+                except Exception as e:  # plan failure -> safe assemble fallback
+                    logger.warning(f"pass-through stitch plan failed ({e}); assemble fallback")
+                    plan = None
+                if plan is not None:
+                    spans, span_record, words, n = plan
+                    first_gap = next((i for i, s in enumerate(spans) if not s[2]), None)
+                    prefix_words = (
+                        sum(hi - lo for lo, hi, c in spans[:first_gap] if c)
+                        if first_gap is not None else 0
+                    )
+                    if first_gap is not None and prefix_words >= settings.pass_through_stitch_min_words:
+                        return (
+                            {"X-Cache": "MISS-STITCH", "X-Cache-Key": key},
+                            self._timed_chunks(
+                                self._progressive_stitch_stream(
+                                    req, provider, model, params_canon, key, record,
+                                    spans, span_record, words, n,
+                                ),
+                                t0,
+                            ),
+                        )
+                    # prefix too short / no cached prefix before the first gap ->
+                    # the assemble path below is just as good (no TTFB win to claim).
+
+            # --- Existing assemble-then-stream stitch path (unchanged) ---
+            # `plan` is reused when the pass-through check above ran but fell
+            # through (ineligible), so the batched lookup + DP run only once.
+            stitched = await self.stitch(req, provider, model, params_canon, plan=plan)
             if stitched is not None:
                 if settings.enable_write_through:
                     await self._store(

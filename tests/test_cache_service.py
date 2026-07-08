@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -319,6 +320,257 @@ async def test_stream_serves_miss_stitch_then_hit(svc, fake_provider, monkeypatc
     h2, _gen2 = await svc.stream(_req_text("hi nitya sir"))
     assert h2["X-Cache"] == "HIT"
     assert fake_provider.calls == seed_calls + 1  # no further synth
+
+
+# -- progressive pass-through stitch (opt-in streaming path) ----------------
+
+
+def _spy_passthrough(svc, monkeypatch) -> list:
+    """Record (in the returned list) whether the progressive pass-through
+    generator is actually iterated. Delegates to the real method, so behavior
+    is unchanged -- only observability is added."""
+    used: list[bool] = []
+    _orig = svc._progressive_stitch_stream
+
+    async def _spy(*a, **kw):
+        used.append(True)
+        async for chunk in _orig(*a, **kw):
+            yield chunk
+
+    monkeypatch.setattr(svc, "_progressive_stitch_stream", _spy)
+    return used
+
+
+def _enable_passthrough(monkeypatch, min_words: int = 3) -> None:
+    monkeypatch.setattr(settings, "predictive_stitch_enabled", True)
+    monkeypatch.setattr(settings, "predictive_stitch_stream_enabled", True)
+    monkeypatch.setattr(settings, "enable_pass_through_stitch", True)
+    monkeypatch.setattr(settings, "pass_through_stitch_min_words", min_words)
+
+
+async def test_pass_through_streams_prefix_then_gap_then_suffix_and_repeats_hit(
+    svc, fake_provider, monkeypatch
+):
+    """Pass-through ON with a qualifying cached prefix: the progressive path
+    streams the assembled clip, synthesizes ONLY the gap, and stores on
+    completion so a repeat HITs."""
+    _enable_passthrough(monkeypatch)
+    for w in ("hello there friend", "how are you today"):  # cached prefix + suffix
+        await svc.create(_req_text(w))
+    seed_calls = fake_provider.calls
+    used = _spy_passthrough(svc, monkeypatch)
+
+    headers, gen = await svc.stream(_req_text("hello there friend NAME how are you today"))
+    assert headers["X-Cache"] == "MISS-STITCH"
+    audio = b"".join([c async for c in gen])
+    assert len(audio) > 0
+    assert used == [True]                       # the progressive path was taken
+    assert fake_provider.calls == seed_calls + 1  # only the one gap ("NAME") synthesized
+
+    # store-on-completion -> repeat is an instant HIT, no further synth
+    h2, _g2 = await svc.stream(_req_text("hello there friend NAME how are you today"))
+    assert h2["X-Cache"] == "HIT"
+    assert fake_provider.calls == seed_calls + 1
+
+
+async def test_pass_through_prefix_too_short_falls_back_to_assemble(
+    svc, fake_provider, monkeypatch
+):
+    """Cached prefix < pass_through_stitch_min_words -> the progressive path is
+    NOT used; the assemble path handles it (still MISS-STITCH, gap synth'd)."""
+    _enable_passthrough(monkeypatch, min_words=3)
+    for w in ("hi there", "how are you today"):  # 2-word prefix < 3
+        await svc.create(_req_text(w))
+    seed_calls = fake_provider.calls
+    used = _spy_passthrough(svc, monkeypatch)
+
+    headers, gen = await svc.stream(_req_text("hi there NAME how are you today"))
+    assert headers["X-Cache"] == "MISS-STITCH"
+    audio = b"".join([c async for c in gen])
+    assert len(audio) > 0
+    assert used == []                            # progressive path skipped (prefix too short)
+    assert fake_provider.calls == seed_calls + 1  # assemble path still synth'd only the gap
+
+
+async def test_pass_through_non_pcm_format_falls_back_to_assemble(
+    svc, fake_provider, monkeypatch
+):
+    """Requested format != pcm_s16le@16k -> progressive path skipped (per-chunk
+    resample is unsafe); the assemble path converts the whole clip instead."""
+    _enable_passthrough(monkeypatch)
+    for w in ("hello there friend", "how are you today"):
+        await svc.create(_req_text(w))
+    used = _spy_passthrough(svc, monkeypatch)
+
+    req = _req_text("hello there friend NAME how are you today")
+    req.output_format = OutputFormat(container="raw", encoding="mulaw", sample_rate=8000)
+    headers, gen = await svc.stream(req)
+    assert headers["X-Cache"] == "MISS-STITCH"
+    audio = b"".join([c async for c in gen])
+    assert len(audio) > 0
+    assert used == []  # non-PCM -> assemble path
+
+
+async def test_pass_through_flag_off_is_assemble_path(svc, fake_provider, monkeypatch):
+    """Default flag OFF -> the progressive path is never touched; the existing
+    assemble-then-stream path is byte-for-byte unchanged (the no-op guarantee)."""
+    monkeypatch.setattr(settings, "predictive_stitch_enabled", True)
+    monkeypatch.setattr(settings, "predictive_stitch_stream_enabled", True)
+    # enable_pass_through_stitch intentionally left at its default (False)
+    for w in ("hello there friend", "how are you today"):
+        await svc.create(_req_text(w))
+    seed_calls = fake_provider.calls
+    used = _spy_passthrough(svc, monkeypatch)
+
+    headers, gen = await svc.stream(_req_text("hello there friend NAME how are you today"))
+    assert headers["X-Cache"] == "MISS-STITCH"
+    audio = b"".join([c async for c in gen])
+    assert len(audio) > 0
+    assert used == []                            # flag off -> progressive never used
+    assert fake_provider.calls == seed_calls + 1  # assemble path synth'd only the gap
+
+    h2, _g2 = await svc.stream(_req_text("hello there friend NAME how are you today"))
+    assert h2["X-Cache"] == "HIT"
+
+
+async def test_pass_through_eligible_but_first_span_is_gap_falls_back(
+    svc, fake_provider, monkeypatch
+):
+    """Gap at the very start (no cached prefix before it) -> no TTFB win to claim,
+    so the progressive path is skipped and the assemble path runs."""
+    _enable_passthrough(monkeypatch)
+    await svc.create(_req_text("how are you today"))  # only a SUFFIX cached; name leads
+    used = _spy_passthrough(svc, monkeypatch)
+
+    headers, gen = await svc.stream(_req_text("NAME how are you today"))
+    assert headers["X-Cache"] == "MISS-STITCH"
+    audio = b"".join([c async for c in gen])
+    assert len(audio) > 0
+    assert used == []  # no cached prefix -> assemble path
+
+
+class _SlowGapProvider:
+    """Cartesia stand-in whose synth sleeps, recording each gap's finish time so
+    a test can prove the cached prefix streamed BEFORE the gap synth completed."""
+    name = "cartesia"
+    native_encoding = "pcm_s16le"
+    native_sample_rate = 16000
+
+    def __init__(self):
+        self._audio = b"\x01\x00" * 16000   # 1s -- a real clip is >> the 30ms xfade window
+        self.finish_times: dict[str, float] = {}
+
+    async def synth(self, *, text, voice_id, model, language, params) -> AudioResult:
+        await asyncio.sleep(0.15)  # simulate synth latency
+        self.finish_times[text] = time.monotonic()
+        return AudioResult(self._audio, "raw", "pcm_s16le", 16000)
+
+
+async def test_pass_through_emits_prefix_before_gap_synthesizes(tmp_storage, monkeypatch):
+    """The feature's whole purpose: the cached prefix must reach the caller
+    BEFORE the gap synth completes (TTFB ~0, not gap-synth-bound). A slow gap
+    synth proves the ordering -- if the path ever regressed to assemble-style
+    (wait for the gap first), the first chunk would arrive AFTER the gap finished."""
+    _enable_passthrough(monkeypatch)
+    prov = _SlowGapProvider()
+    meta = SQLiteMetadataStore(settings.db_path)
+    await meta.init()
+    blobs = FilesystemBlobStore(settings.blob_dir)
+    await blobs.init()
+    svc = CacheService(meta, blobs, lambda name: prov if name == "cartesia" else None)
+
+    await svc.create(_req_text("hello there friend"))   # cached prefix
+    await svc.create(_req_text("how are you today"))    # cached suffix
+
+    headers, gen = await svc.stream(_req_text("hello there friend NAME how are you today"))
+    assert headers["X-Cache"] == "MISS-STITCH"
+    first_chunk_at = None
+    async for chunk in gen:
+        if first_chunk_at is None:
+            first_chunk_at = time.monotonic()
+    assert first_chunk_at is not None
+    assert "NAME" in prov.finish_times                       # the gap was synthesized
+    assert first_chunk_at < prov.finish_times["NAME"], (     # prefix streamed FIRST
+        first_chunk_at - prov.finish_times["NAME"]
+    )
+
+
+class _GapFailsProvider:
+    """Cartesia stand-in that FAILS the gap synth (raises) but succeeds for the
+    seeded prefix/suffix, to verify a mid-stream gap failure truncates cleanly."""
+    name = "cartesia"
+    native_encoding = "pcm_s16le"
+    native_sample_rate = 16000
+
+    def __init__(self):
+        self._audio = b"\x01\x00" * 16000   # 1s -- a real clip is >> the 30ms xfade window
+
+    async def synth(self, *, text, voice_id, model, language, params) -> AudioResult:
+        if text.strip() == "NAME":
+            raise RuntimeError("simulated provider failure on the gap")
+        return AudioResult(self._audio, "raw", "pcm_s16le", 16000)
+
+
+async def test_pass_through_truncates_cleanly_on_gap_synth_error(tmp_storage, monkeypatch):
+    """A gap-synth failure mid-stream (after headers + prefix are committed) must
+    NOT raise out of the generator -- it can't become a clean 500 once audio
+    headers are sent. It truncates (prefix delivered, stream ends), the failed
+    synth is not credited, and nothing is cached."""
+    _enable_passthrough(monkeypatch)
+    prov = _GapFailsProvider()
+    meta = SQLiteMetadataStore(settings.db_path)
+    await meta.init()
+    blobs = FilesystemBlobStore(settings.blob_dir)
+    await blobs.init()
+    svc = CacheService(meta, blobs, lambda name: prov if name == "cartesia" else None)
+
+    await svc.create(_req_text("hello there friend"))
+    await svc.create(_req_text("how are you today"))
+    synth_before = (await meta.metrics_summary())["synth_calls"]  # 2, from the seeds
+
+    headers, gen = await svc.stream(_req_text("hello there friend NAME how are you today"))
+    assert headers["X-Cache"] == "MISS-STITCH"
+    chunks = []
+    async for chunk in gen:          # must NOT raise -- failure truncates
+        chunks.append(chunk)
+    audio = b"".join(chunks)
+    assert len(audio) > 0            # the cached prefix was still delivered
+
+    # the failed gap synth is NOT credited (synth_calls unchanged from the seeds)
+    synth_after = (await meta.metrics_summary())["synth_calls"]
+    assert synth_after == synth_before
+
+    cached, _rec, _p, _m, _k = await svc.check(_req_text("hello there friend NAME how are you today"))
+    assert cached is False           # truncated stream -> nothing cached for reuse
+
+
+async def test_pass_through_synthesizes_multiple_gaps_concurrently(tmp_storage, monkeypatch):
+    """Multiple gaps synthesize CONCURRENTLY (total ~= max gap, not the sum).
+    Two gaps at ~0.15s each: sequential would be ~0.30s+, concurrent ~0.15-0.20s.
+    Proves the gaps overlap, not run one-after-the-other."""
+    _enable_passthrough(monkeypatch)
+    prov = _SlowGapProvider()
+    meta = SQLiteMetadataStore(settings.db_path)
+    await meta.init()
+    blobs = FilesystemBlobStore(settings.blob_dir)
+    await blobs.init()
+    svc = CacheService(meta, blobs, lambda name: prov if name == "cartesia" else None)
+
+    await svc.create(_req_text("hello there friend"))   # cached prefix (3 words)
+    await svc.create(_req_text("mid"))                  # cached middle (1 word)
+    # spans: [0:3] cached, [3:4] gap "NAME", [4:5] cached "mid", [5:6] gap "NAME2"
+
+    t0 = time.monotonic()
+    headers, gen = await svc.stream(_req_text("hello there friend NAME mid NAME2"))
+    assert headers["X-Cache"] == "MISS-STITCH"
+    audio = b"".join([c async for c in gen])
+    elapsed = time.monotonic() - t0
+
+    assert len(audio) > 0
+    assert "NAME" in prov.finish_times and "NAME2" in prov.finish_times  # both gaps ran
+    # concurrent (<= ~0.2s), NOT sequential (>= ~0.3s). 0.27s splits the two with margin.
+    assert elapsed < 0.27, f"gaps were sequential, not concurrent (elapsed={elapsed})"
+
 
 
 def test_stitch_clips_removes_dc_and_silence():

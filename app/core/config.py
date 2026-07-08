@@ -189,8 +189,22 @@ class Settings(BaseSettings):
     # the trade of "first request waits for gap-synth + assembly" vs "reuse cached
     # sub-phrases and cache the assembled clip for instant repeat HITs".
     predictive_stitch_stream_enabled: bool = True
+    # --- Progressive pass-through stitch (opt-in /tts/stream path) ---
+    # When true AND /tts/stream is a stitchable MISS with a cached PREFIX (>= the
+    # min-words gate below) AND the requested format == native pcm_s16le@16k,
+    # stream the cached prefix IMMEDIATELY while the first gap synthesizes
+    # (TTFB ~0), holding only the ~xfade window per seam. Purely additive: when
+    # false (default) the existing assemble-then-stream stitch path is byte-for-
+    # byte unchanged, and on any ineligibility/error this falls back to it.
+    # Mid-utterance pause remains for later gaps (only live gap-streaming removes
+    # it) -- this only fixes the START (perceptually-important) latency.
+    enable_pass_through_stitch: bool = True
+    # Minimum cached-prefix word count to use the pass-through path. Below this
+    # (or no cached prefix before the first gap) it falls back to the assemble
+    # path (a 1-2 word prefix isn't worth streaming early).
+    pass_through_stitch_min_words: int = 2
     # --- Stitch seam-DSP knobs (numpy) — tune assembled-clip quality via env. ---
-    predictive_stitch_xfade_ms: float = 15.0        # crossfade overlap at each splice (10-25ms; short clicks, long smears)
+    predictive_stitch_xfade_ms: float = 30.0        # crossfade overlap at each splice (15-30ms typical; shorter clicks, longer smears)
     predictive_stitch_target_rms_db: float = -20.0  # per-fragment loudness target (speech ~-23..-18 dBFS)
     predictive_stitch_rms_floor_db: float = -55.0   # below this a fragment isn't amplified (don't hiss up a breath/gap)
     predictive_stitch_sil_relative_db: float = 25.0 # silence gate: a window this many dB below the clip peak is trimmed (HIGHER = more aggressive gap cutting)

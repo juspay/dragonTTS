@@ -107,6 +107,15 @@ spec:
               value: "true"
             - name: PREDICTIVE_STITCH_MIN_COVERAGE
               value: "0.5"
+            # Progressive pass-through stitch (opt-in). OFF by default: the
+            # existing assemble-then-stream stitch path is unchanged. When on,
+            # /tts/stream emits the cached prefix immediately while the first gap
+            # synthesizes (TTFB ~0). Only fires for pcm_s16le@16k requests with a
+            # cached prefix >= PASS_THROUGH_STITCH_MIN_WORDS words.
+            - name: ENABLE_PASS_THROUGH_STITCH
+              value: "true"
+            - name: PASS_THROUGH_STITCH_MIN_WORDS
+              value: "2"
             # --- Provider credentials ---
             - name: CARTESIA_API_KEY
               value: ""
