@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
+from pydantic import BaseModel
 
 from app.audio.format import content_type_for
 from app.schemas.cache import CacheEntryInfo, PaginatedCache
@@ -39,14 +40,21 @@ async def list_cache(
     voice_id: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    q: str | None = Query(default=None, description="filter by text (see match)"),
+    match: str = Query(default="exact", description="'exact' (default) or 'substring'"),
+    created_after: str | None = Query(default=None, description="YYYY-MM-DD, inclusive"),
+    created_before: str | None = Query(default=None, description="YYYY-MM-DD, exclusive"),
 ):
-    """Paginated entry listing. limit is clamped to [1, MAX_CACHE_LIST_LIMIT]."""
+    """Paginated entry listing with optional text/date filters. limit is clamped
+    to [1, MAX_CACHE_LIST_LIMIT]. q+match filters text; created_after is
+    inclusive, created_before is exclusive (both YYYY-MM-DD)."""
     metadata = request.app.state.metadata
     limit = max(1, min(limit, MAX_CACHE_LIST_LIMIT))
     offset = max(0, offset)
     # Fetch one extra row to detect a next page without a COUNT(*) scan.
     records = await metadata.list(
-        provider=provider, voice_id=voice_id, limit=limit + 1, offset=offset
+        provider=provider, voice_id=voice_id, limit=limit + 1, offset=offset,
+        q=q, match=match, created_before=created_before, created_after=created_after,
     )
     has_next = len(records) > limit
     entries = [_to_info(r) for r in records[:limit]]
@@ -90,16 +98,91 @@ async def stats(
     }
 
 
+@router.get("/stats/daily")
+async def stats_daily(
+    request: Request,
+    from_date: str | None = Query(default=None, alias="from"),
+    to_date: str | None = Query(default=None, alias="to"),
+    provider: str | None = None,
+):
+    """Extensive day-wise analytics: per date, the full metric totals (hit_rate,
+    words_from_cache_pct, stitch_coverage_avg derived) plus a per-provider
+    breakdown. ``provider`` narrows the view to one provider (its totals then
+    reflect that provider only). ?from=&to= YYYY-MM-DD (UTC dates)."""
+    for label, value in (("from", from_date), ("to", to_date)):
+        if value is not None:
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"invalid {label}; use YYYY-MM-DD")
+    cache = request.app.state.cache
+    return await cache.daily_stats(from_date=from_date, to_date=to_date, provider=provider)
+
+
 @router.post("/cache/clear")
 async def clear_cache(
     request: Request,
     provider: str | None = None,
     voice_id: str | None = None,
+    dry_run: bool = False,
 ):
-    """Delete all entries (optionally filtered by provider/voice_id)."""
+    """Delete all entries (optionally filtered by provider/voice_id). Pass
+    ``dry_run=true`` to preview the count/bytes/providers without deleting."""
     cache = request.app.state.cache
+    if dry_run:
+        preview = await cache.clear_preview(provider=provider, voice_id=voice_id)
+        return {"status": "preview", **preview}
     count = await cache.clear(provider=provider, voice_id=voice_id)
     return {"status": "cleared", "deleted": count}
+
+
+class DeleteByTextBody(BaseModel):
+    """Body for POST /cache/delete-by-text."""
+
+    text: str | None = None
+    provider: str | None = None
+    voice_id: str | None = None
+    match: str = "exact"  # 'exact' (default) or 'substring'
+    dry_run: bool = True  # safe by default — set False to actually delete
+
+
+@router.post("/cache/delete-by-text")
+async def delete_by_text(body: DeleteByTextBody, request: Request):
+    """Delete cache entries by text (exact or substring), optionally narrowed by
+    provider/voice_id. ``dry_run`` defaults True — previews matched entries +
+    keys without deleting; set ``dry_run: false`` to delete. Requires at least
+    one filter (text/provider/voice_id) — use /cache/clear to wipe everything."""
+    cache = request.app.state.cache
+    try:
+        return await cache.delete_by_text(
+            text=body.text, provider=body.provider, voice_id=body.voice_id,
+            match=body.match, dry_run=body.dry_run,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/cache/delete-by-age")
+async def delete_by_age(
+    request: Request,
+    older_than_days: int = Query(..., description="evict entries older than N days"),
+    dry_run: bool = Query(True, description="preview unless set to false"),
+):
+    """Delete entries older than ``older_than_days`` (by created_at). ``dry_run``
+    defaults True — preview matched entries without deleting."""
+    cache = request.app.state.cache
+    return await cache.delete_by_age(older_than_days=older_than_days, dry_run=dry_run)
+
+
+@router.post("/cache/backfill-ttl")
+async def backfill_ttl(request: Request):
+    """One-shot: assign a random 48–72h expiry to pre-existing entries that have
+    no TTL (created before length-scaled TTL, e.g. under ttl_seconds=0) so they
+    age out instead of living forever. Idempotent — only touches NULL-TTL rows,
+    so it's safe to call repeatedly. Run once after deploying this feature."""
+    cache = request.app.state.cache
+    count = await cache.backfill_missing_ttl()
+    return {"status": "backfilled", "updated": count}
 
 
 @router.get("/cache/{key}")

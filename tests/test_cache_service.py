@@ -416,7 +416,7 @@ async def test_pass_through_flag_off_is_assemble_path(svc, fake_provider, monkey
     assemble-then-stream path is byte-for-byte unchanged (the no-op guarantee)."""
     monkeypatch.setattr(settings, "predictive_stitch_enabled", True)
     monkeypatch.setattr(settings, "predictive_stitch_stream_enabled", True)
-    # enable_pass_through_stitch intentionally left at its default (False)
+    monkeypatch.setattr(settings, "enable_pass_through_stitch", False)  # test the OFF path explicitly (default is True)
     for w in ("hello there friend", "how are you today"):
         await svc.create(_req_text(w))
     seed_calls = fake_provider.calls

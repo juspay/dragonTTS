@@ -40,7 +40,7 @@ from app.core.logging import logger
 from app.providers.base import AudioResult, BaseTTSProvider, ProviderError
 from app.providers.registry import ProviderNotConfigured
 from app.schemas.tts import TTSRequest
-from app.storage.base import CacheRecord
+from app.storage.base import CacheRecord, escape_like
 
 
 def _wc(text: str | None) -> int:
@@ -342,6 +342,26 @@ class CacheService:
         await self._timed("synth", t0)
         return result
 
+    @staticmethod
+    def _ttl_expires_at(text: str) -> str | None:
+        """Length-scaled expiry timestamp (ISO UTC, no microseconds — matches the
+        purge/backfill format so SQL ``ttl_expires_at < now`` string comparison
+        is correct). ``clamp(BASE + PER_WORD*words, BASE, MAX)``. Applied to
+        every stored entry (write-through AND warmer) — there's no permanent
+        tier; the periodic purge job evicts expired rows + blobs. Returns None
+        when TTL is disabled (``BASE<=0``) so the row never expires."""
+        if settings.cache_ttl_base_seconds <= 0:
+            return None
+        words = _wc(text)
+        ttl = min(
+            settings.cache_ttl_base_seconds
+            + settings.cache_ttl_per_word_seconds * words,
+            settings.cache_ttl_max_seconds,
+        )
+        return (datetime.now(timezone.utc) + timedelta(seconds=ttl)).strftime(
+            "%Y-%m-%dT%H:%M:%S+00:00"
+        )
+
     async def _store(
         self,
         key: str,
@@ -366,11 +386,7 @@ class CacheService:
             existing = await self._metadata.get(key)
         now = datetime.now(timezone.utc)
         storage_path = await self._blobs.put(key, audio)
-        ttl = (
-            (now + timedelta(seconds=settings.ttl_seconds)).isoformat()
-            if settings.ttl_seconds
-            else None
-        )
+        ttl = self._ttl_expires_at(req.transcript)
         record = CacheRecord(
             key=key,
             provider=provider,
@@ -1287,6 +1303,190 @@ class CacheService:
             await self._metrics.record_metrics(deletes=len(deleted))
         logger.info(f"CLEAR removed {len(deleted)} entries (provider={provider}, voice_id={voice_id})")
         return len(deleted)
+
+    async def purge_expired(self) -> int:
+        """Delete entries whose TTL has expired — metadata first (one atomic
+        transaction, totals kept consistent), then unlink blobs.
+
+        Order matters: if a blob unlink fails we log and continue — the row is
+        already gone, so an orphaned file is harmless (reaped by
+        :meth:`reconcile_blobs` at next startup) rather than leaving metadata
+        pointing at a missing file. Returns the number of entries purged."""
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        rows = await self._metadata.purge_expired(now_iso)
+        for _prov, _size, path in rows:
+            try:
+                await self._blobs.delete(path)
+            except Exception as e:
+                logger.warning(f"purge: blob delete failed for {path}: {e}")
+        if rows:
+            logger.info(f"TTL purge: removed {len(rows)} expired entries")
+        return len(rows)
+
+    async def backfill_missing_ttl(self) -> int:
+        """One-shot admin op: give every pre-existing NULL-TTL row a RANDOM
+        expiry in [CACHE_TTL_BACKFILL_MIN_HOURS, MAX_HOURS] so legacy entries
+        (created before length-scaled TTL, e.g. under ttl_seconds=0) age out
+        instead of living forever. Idempotent — only touches NULL rows. Trigger
+        via POST /cache/backfill-ttl (not at startup). Returns rows backfilled."""
+        n = await self._metadata.backfill_missing_ttl(
+            settings.cache_ttl_backfill_min_hours,
+            settings.cache_ttl_backfill_max_hours,
+        )
+        logger.info(f"TTL backfill: set random expiry on {n} NULL-TTL entries")
+        return n
+
+    # -- analytics + cache control -------------------------------------------
+
+    @staticmethod
+    def _derive(m: dict) -> dict:
+        """Add hit_rate (+ words_from_cache_pct, stitch_coverage_avg when the
+        raw sums exist) to a metrics map. Per-provider rows lack
+        words_synthesized/stitch, so only hit_rate is added there."""
+        out = dict(m)
+        req = m.get("requests", 0)
+        out["hit_rate"] = round(m["hits"] / req, 4) if req else None
+        wserved = m.get("words_served", 0)
+        wsyn = m.get("words_synthesized")
+        if wserved and wsyn is not None:
+            # clamp at 0 — words_synthesized can transiently exceed words_served
+            # (stitch/gap accounting) and a negative savings rate is nonsensical.
+            out["words_from_cache_pct"] = max(0, int((wserved - wsyn) * 100 / wserved))
+        assembled = (m.get("stitch_words_assembled", 0) or 0) + (
+            m.get("stitch_words_synthesized", 0) or 0
+        )
+        if assembled:
+            out["stitch_coverage_avg"] = round(
+                (m.get("stitch_words_assembled", 0) or 0) / assembled, 4
+            )
+        return out
+
+    async def daily_stats(
+        self, from_date: str | None = None, to_date: str | None = None,
+        provider: str | None = None,
+    ) -> dict:
+        """Extensive day-wise metrics: per date, derived totals (hit_rate,
+        words_from_cache_pct, stitch_coverage_avg on top of the raw sums) and a
+        per-provider breakdown. ``provider`` narrows the view to one provider —
+        the day's totals then reflect that provider only."""
+        raw = await self._metadata.daily_summary(from_date, to_date)
+        days = []
+        for date in sorted(raw):
+            byp_all = raw[date]["by_provider"]
+            if provider:
+                byp = {provider: byp_all[provider]} if provider in byp_all else {}
+                base = dict(byp.get(provider, {}))
+            else:
+                byp = dict(byp_all)
+                base = dict(raw[date]["totals"])
+            days.append({
+                "date": date,
+                "totals": self._derive(base),
+                "by_provider": {p: self._derive(m) for p, m in byp.items()},
+            })
+        return {"range": {"from": from_date, "to": to_date}, "days": days}
+
+    async def _delete_rows(self, rows: list[dict], *, dry_run: bool, label: str) -> None:
+        """Blob cleanup for a delete_where result (metadata already gone). Logs +
+        continues on a per-blob failure so one bad unlink can't abort the batch."""
+        if dry_run or not rows:
+            return
+        for r in rows:
+            try:
+                await self._blobs.delete(r["storage_path"])
+            except Exception as e:
+                logger.warning(f"{label}: blob delete failed for {r['storage_path']}: {e}")
+        await self._metrics.record_metrics(deletes=len(rows))
+
+    @staticmethod
+    def _entries(rows: list[dict]) -> list[dict]:
+        return [
+            {"key": r["key"], "provider": r["provider"], "voice_id": r["voice_id"], "text": r["text"]}
+            for r in rows
+        ]
+
+    async def delete_by_text(
+        self, text: str | None = None, provider: str | None = None,
+        voice_id: str | None = None, match: str = "exact", dry_run: bool = True,
+    ) -> dict:
+        """Delete cache entries by text (exact or substring), optionally narrowed
+        by provider/voice. ``dry_run`` defaults True — preview matches + keys
+        without deleting; set False to delete. Returns matched/deleted counts and
+        the matched entries."""
+        clauses: list[str] = []
+        args: list = []
+        if text is not None:
+            if match.lower() == "substring":
+                # ESCAPE '\\' so a user '%'/_'_' in text matches literally, not as
+                # a wildcard (else text='_' would match every single-char row).
+                clauses.append("text LIKE ? ESCAPE '\\'")
+                args.append(f"%{escape_like(text)}%")
+            else:
+                clauses.append("text = ?")
+                args.append(text)
+        if provider:
+            clauses.append("provider = ?")
+            args.append(provider)
+        if voice_id:
+            clauses.append("voice_id = ?")
+            args.append(voice_id)
+        if not clauses:
+            # An empty filter would match (and with dry_run=false, DELETE) the
+            # ENTIRE cache — that's what /cache/clear is for. Require >= 1 filter.
+            raise ValueError(
+                "delete-by-text requires at least one of text/provider/voice_id"
+            )
+        where_sql = " AND ".join(clauses)
+        rows = await self._metadata.delete_where(where_sql, args, dry_run=dry_run)
+        await self._delete_rows(rows, dry_run=dry_run, label="delete-by-text")
+        return {
+            "matched": len(rows),
+            "deleted": 0 if dry_run else len(rows),
+            "dry_run": dry_run,
+            "entries": self._entries(rows),
+        }
+
+    async def delete_by_age(self, older_than_days: int, dry_run: bool = True) -> dict:
+        """Delete entries older than ``older_than_days`` (by created_at). Same
+        dry_run contract as delete_by_text."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).strftime(
+            "%Y-%m-%dT%H:%M:%S+00:00"
+        )
+        rows = await self._metadata.delete_where("created_at < ?", [cutoff], dry_run=dry_run)
+        await self._delete_rows(rows, dry_run=dry_run, label="delete-by-age")
+        return {
+            "matched": len(rows),
+            "deleted": 0 if dry_run else len(rows),
+            "dry_run": dry_run,
+            "older_than_days": older_than_days,
+            "entries": self._entries(rows),
+        }
+
+    async def clear_preview(
+        self, provider: str | None = None, voice_id: str | None = None
+    ) -> dict:
+        """Dry-run preview for /cache/clear: count + bytes + per-provider breakdown
+        of what WOULD be deleted, without touching anything."""
+        clauses: list[str] = []
+        args: list = []
+        if provider:
+            clauses.append("provider = ?")
+            args.append(provider)
+        if voice_id:
+            clauses.append("voice_id = ?")
+            args.append(voice_id)
+        where_sql = " AND ".join(clauses) if clauses else ""
+        rows = await self._metadata.delete_where(where_sql, args, dry_run=True)
+        by_prov: dict[str, list[int]] = {}
+        for r in rows:
+            d = by_prov.setdefault(r["provider"], [0, 0])
+            d[0] += 1
+            d[1] += r["size_bytes"]
+        return {
+            "would_delete": len(rows),
+            "bytes": sum(r["size_bytes"] for r in rows),
+            "by_provider": {p: {"entries": c, "bytes": b} for p, (c, b) in by_prov.items()},
+        }
 
     async def reconcile_blobs(self) -> int:
         """Delete blob files that have no metadata row.

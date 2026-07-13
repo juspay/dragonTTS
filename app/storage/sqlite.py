@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from app.core.logging import logger
-from app.storage.base import CacheRecord
+from app.storage.base import CacheRecord, escape_like
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cache_entries (
@@ -464,6 +464,10 @@ class SQLiteMetadataStore:
         voice_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        q: str | None = None,
+        match: str = "exact",
+        created_before: str | None = None,
+        created_after: str | None = None,
     ) -> list[CacheRecord]:
         clauses: list[str] = []
         args: list = []
@@ -473,6 +477,25 @@ class SQLiteMetadataStore:
         if voice_id:
             clauses.append("voice_id = ?")
             args.append(voice_id)
+        if q:
+            if match.lower() == "substring":
+                # ESCAPE '\\' so a user '%'/_'_' in q matches literally, not as a
+                # wildcard (else q='_' would match every single-char text row).
+                clauses.append("text LIKE ? ESCAPE '\\'")
+                args.append(f"%{escape_like(q)}%")
+            else:
+                clauses.append("text = ?")
+                args.append(q)
+        # created_at is a full ISO timestamp; bare-date args compare sensibly:
+        # created_after=YYYY-MM-DD is inclusive of that whole day (timestamp sorts
+        # after the bare date); created_before=YYYY-MM-DD is exclusive (strictly
+        # before that day's start).
+        if created_after:
+            clauses.append("created_at >= ?")
+            args.append(created_after)
+        if created_before:
+            clauses.append("created_at < ?")
+            args.append(created_before)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         args.append(limit)
         args.append(offset)
@@ -541,6 +564,178 @@ class SQLiteMetadataStore:
                         conn.execute(totals_sql, (prov, de, db, dw))
                 conn.execute("COMMIT")
                 return [(r[0], r[1], r[2]) for r in rows]
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+        return await self._run(_d)
+
+    async def purge_expired(self, now_iso: str) -> list[tuple]:
+        """Delete rows whose ``ttl_expires_at`` is set and < ``now_iso``, adjusting
+        ``provider_totals`` atomically; return ``(provider, size_bytes,
+        storage_path)`` per row so the caller can unlink the blobs. Mirrors
+        :meth:`delete_filtered`'s transaction so a concurrent insert can't escape
+        the purge or drift totals. Rows with NULL ``ttl_expires_at`` (never
+        expiring) are left alone."""
+        where = " WHERE ttl_expires_at IS NOT NULL AND ttl_expires_at < ?"
+        totals_sql = (
+            "INSERT INTO provider_totals (provider, entries, total_bytes, total_words) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(provider) DO UPDATE SET "
+            "entries = entries + excluded.entries, total_bytes = total_bytes + excluded.total_bytes, "
+            "total_words = total_words + excluded.total_words"
+        )
+
+        def _d(conn: sqlite3.Connection) -> list[tuple]:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    f"SELECT provider, size_bytes, storage_path, text FROM cache_entries{where}",
+                    (now_iso,),
+                ).fetchall()
+                if rows:
+                    conn.execute(f"DELETE FROM cache_entries{where}", (now_iso,))
+                    deltas: dict[str, list[int]] = {}
+                    for r in rows:
+                        d = deltas.setdefault(r[0], [0, 0, 0])
+                        d[0] -= 1
+                        d[1] -= r[1]
+                        d[2] -= _wc(r[3])
+                    for prov, (de, db, dw) in deltas.items():
+                        conn.execute(totals_sql, (prov, de, db, dw))
+                conn.execute("COMMIT")
+                return [(r[0], r[1], r[2]) for r in rows]
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+        return await self._run(_d)
+
+    async def backfill_missing_ttl(self, min_hours: int, max_hours: int) -> int:
+        """Set a RANDOM expiry in ``[min_hours, max_hours]`` from now on every row
+        whose ``ttl_expires_at`` is NULL (pre-existing entries created before
+        length-scaled TTL, e.g. under ``ttl_seconds=0``). Idempotent — only
+        touches NULL rows, so re-running on restart is a no-op. Returns the
+        number of rows backfilled.
+
+        ``abs(random()) % span`` is evaluated per row, so expiries spread across
+        the window instead of expiring en masse (which would spike re-synths).
+        """
+        if max_hours < min_hours:
+            max_hours = min_hours
+        span = max(1, max_hours - min_hours + 1)  # inclusive [min, max]
+        sql = (
+            "UPDATE cache_entries "
+            "SET ttl_expires_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', "
+            "(? + (abs(random()) % ?)) || ' hours') "
+            "WHERE ttl_expires_at IS NULL"
+        )
+
+        def _u(conn: sqlite3.Connection) -> int:
+            cur = conn.execute(sql, (min_hours, span))
+            return cur.rowcount
+
+        return await self._run(_u)
+
+    async def daily_summary(
+        self, from_date: str | None = None, to_date: str | None = None
+    ) -> dict:
+        """Extensive day-wise metrics over [from_date, to_date] (UTC dates):
+        for each date, the full ``metrics_daily`` totals (requests, hits, misses,
+        synth_calls, words_served/synthesized, stitch_*, bytes_served, creates,
+        deletes) AND a per-provider breakdown from ``metrics_daily_provider``.
+        Returns ``{date: {"totals": {...raw sums...}, "by_provider": {prov: {...}}}}``.
+        Derived rates (hit_rate, words_from_cache_pct, stitch_coverage_avg) are
+        computed by the caller — this returns raw sums only."""
+        clauses: list[str] = []
+        args: list = []
+        if from_date:
+            clauses.append("date >= ?")
+            args.append(from_date)
+        if to_date:
+            clauses.append("date <= ?")
+            args.append(to_date)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        def _q(conn: sqlite3.Connection) -> dict:
+            out: dict[str, dict] = {}
+            for r in conn.execute(f"SELECT * FROM metrics_daily{where} ORDER BY date", args):
+                d = r["date"]
+                out.setdefault(d, {"totals": {}, "by_provider": {}})
+                out[d]["totals"] = {
+                    "requests": r["requests"], "hits": r["hits"], "misses": r["misses"],
+                    "bytes_served": r["bytes_served"], "synth_calls": r["synth_calls"],
+                    "base64_uploads": r["base64_uploads"], "creates": r["creates"],
+                    "deletes": r["deletes"], "words_served": r["words_served"],
+                    "words_synthesized": r["words_synthesized"],
+                    "stitch_calls": r["stitch_calls"],
+                    "stitch_words_assembled": r["stitch_words_assembled"],
+                    "stitch_words_synthesized": r["stitch_words_synthesized"],
+                }
+            prow = (
+                "SELECT date, provider, requests, hits, misses, synth_calls, "
+                f"bytes_served, words_served FROM metrics_daily_provider{where} "
+                "ORDER BY date, provider"
+            )
+            for r in conn.execute(prow, args):
+                d = r["date"]
+                out.setdefault(d, {"totals": {}, "by_provider": {}})
+                out[d]["by_provider"][r["provider"]] = {
+                    "requests": r["requests"], "hits": r["hits"], "misses": r["misses"],
+                    "synth_calls": r["synth_calls"], "bytes_served": r["bytes_served"],
+                    "words_served": r["words_served"],
+                }
+            return out
+
+        return await self._run(_q)
+
+    async def delete_where(
+        self, where_sql: str, args: list, *, dry_run: bool
+    ) -> list[dict]:
+        """Generic filtered delete for the cache-control endpoints. SELECTs rows
+        matching ``where_sql`` (always returned for preview + blob cleanup); when
+        not ``dry_run``, DELETEs them and adjusts ``provider_totals`` in one
+        ``BEGIN IMMEDIATE`` transaction. Returns a list of dicts
+        ``{provider, size_bytes, storage_path, text, key, voice_id}`` per matched
+        row. ``where_sql`` is the clause text without the leading ``WHERE``."""
+        where = f" WHERE {where_sql}" if where_sql else ""
+        select = (
+            f"SELECT provider, size_bytes, storage_path, text, key, voice_id "
+            f"FROM cache_entries{where}"
+        )
+        totals_sql = (
+            "INSERT INTO provider_totals (provider, entries, total_bytes, total_words) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(provider) DO UPDATE SET "
+            "entries = entries + excluded.entries, total_bytes = total_bytes + excluded.total_bytes, "
+            "total_words = total_words + excluded.total_words"
+        )
+        cols = ("provider", "size_bytes", "storage_path", "text", "key", "voice_id")
+
+        def _matched(conn: sqlite3.Connection) -> list[dict]:
+            return [dict(zip(cols, r)) for r in conn.execute(select, args).fetchall()]
+
+        def _d(conn: sqlite3.Connection) -> list[dict]:
+            if dry_run:
+                return _matched(conn)  # preview only — no write lock taken
+            # SELECT inside the write transaction so a concurrent insert between
+            # the snapshot and the DELETE can't orphan a blob or drift the totals
+            # delta (TOCTOU-safe, matching delete_filtered / purge_expired).
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(select, args).fetchall()
+                if rows:
+                    conn.execute(f"DELETE FROM cache_entries{where}", args)
+                    deltas: dict[str, list[int]] = {}
+                    for r in rows:
+                        d = deltas.setdefault(r[0], [0, 0, 0])
+                        d[0] -= 1
+                        d[1] -= r[1]
+                        d[2] -= _wc(r[3])
+                    for prov, (de, db, dw) in deltas.items():
+                        conn.execute(totals_sql, (prov, de, db, dw))
+                conn.execute("COMMIT")
+                return [dict(zip(cols, r)) for r in rows]
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise

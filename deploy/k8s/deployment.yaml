@@ -39,10 +39,26 @@ spec:
             # --- Cache policy ---
             - name: MAX_CACHE_BYTES
               value: "0"
-            - name: TTL_SECONDS
-              value: "0"
             - name: ENABLE_WRITE_THROUGH
               value: "true"
+            # --- Length-scaled TTL (applied to every stored entry; no permanent
+            # tier). ttl = clamp(BASE + PER_WORD*words, BASE, MAX). A background
+            # purge (TTL_PURGE_INTERVAL_SECONDS) deletes expired rows + blobs.
+            # TTL_SECONDS is legacy/unused (kept for back-compat).
+            - name: CACHE_TTL_BASE_SECONDS
+              value: "172800"        # 48h floor — min TTL for any phrase
+            - name: CACHE_TTL_PER_WORD_SECONDS
+              value: "21600"         # +6h per word
+            - name: CACHE_TTL_MAX_SECONDS
+              value: "864000"        # 10d cap
+            - name: TTL_PURGE_INTERVAL_SECONDS
+              value: "1200"          # purge sweep every 20 min
+            # Backfill range for pre-existing NULL-TTL entries (trigger once via
+            # POST /cache/backfill-ttl after deploying — not run at startup).
+            - name: CACHE_TTL_BACKFILL_MIN_HOURS
+              value: "48"
+            - name: CACHE_TTL_BACKFILL_MAX_HOURS
+              value: "72"
             # --- TTS text normalization ---
             # Expand numbers to words (Indian: lakh/crore) before synth AND in the
             # Number normalization is OFF by default (not needed yet). When on it
@@ -129,10 +145,6 @@ spec:
               value: ""
             - name: GOOGLE_CREDENTIALS_PATH
               value: ""
-          volumeMounts:
-            - name: data
-              mountPath: /app/data
-              subPath: data
           readinessProbe:
             httpGet:
               path: /health
@@ -151,12 +163,16 @@ spec:
           resources:
             requests:
               cpu: 1000m
-              memory: 900Mi
+              memory: 1900Mi
               ephemeral-storage: 1Gi
             limits:
               cpu: 1000m
-              memory: 1300Mi
+              memory: 2300Mi
               ephemeral-storage: 2Gi
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+              subPath: data
       volumes:
         - name: data
           persistentVolumeClaim:

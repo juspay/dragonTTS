@@ -78,8 +78,26 @@ class Settings(BaseSettings):
 
     # --- Cache policy ---
     max_cache_bytes: int = 0  # 0 = unlimited
-    ttl_seconds: int = 0  # 0 = no expiry
     enable_write_through: bool = True
+    # --- Length-scaled TTL (applied to EVERY stored entry: write-through AND
+    # warmer). ttl_for(words) = clamp(BASE + PER_WORD*words, BASE, MAX), so
+    # longer phrases survive longer (more synth savings to preserve) and short
+    # ones age out faster. There is no permanent tier: the periodic purge job
+    # (TTL_PURGE_INTERVAL_SECONDS) deletes expired rows + blobs. Set BASE<=0 to
+    # disable TTL entirely (entries never expire, no purge). Supersedes the flat
+    # ttl_seconds knob below, which is kept only for back-compat.
+    cache_ttl_base_seconds: int = 172800  # 48h floor — min TTL for any phrase
+    cache_ttl_per_word_seconds: int = 21600  # +6h per word
+    cache_ttl_max_seconds: int = 864000  # 10d cap
+    ttl_purge_interval_seconds: int = 1200  # purge sweep cadence (20 min)
+    # Backfill for pre-existing entries (ttl_expires_at IS NULL, e.g. created
+    # before this feature under ttl_seconds=0). At startup each NULL row gets a
+    # RANDOM expiry in [min,max] hours so they age out gradually instead of
+    # becoming permanent — and randomized (not flat) to avoid a synchronized
+    # re-synth spike. Idempotent: only touches NULL rows.
+    cache_ttl_backfill_min_hours: int = 48
+    cache_ttl_backfill_max_hours: int = 72
+    ttl_seconds: int = 0  # legacy flat TTL; unused now (length-scaled TTL supersedes)
     # --- TTS text normalization ---
     # Expand standalone numbers to English words (Indian grouping) before synth,
     # applied to both the synth text and the cache key (so "599" and

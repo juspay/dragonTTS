@@ -88,11 +88,30 @@ async def lifespan(app: FastAPI):
 
     checkpoint_task = asyncio.create_task(_checkpoint_loop())
 
+    # Periodic TTL purge: delete expired entries (rows + blobs). Cadence is
+    # coarse (default 20 min) since TTLs are hour-to-day scale. Backfill of
+    # pre-existing NULL-TTL entries is NOT automatic — trigger it once via
+    # POST /cache/backfill-ttl after deploying this feature.
+    async def _ttl_purge_loop():
+        while True:
+            await asyncio.sleep(settings.ttl_purge_interval_seconds)
+            try:
+                await cache.purge_expired()
+            except Exception as e:
+                logger.debug(f"TTL purge failed: {e}")
+
+    ttl_purge_task = asyncio.create_task(_ttl_purge_loop())
+
     logger.info(f"DragonTTS ready — providers: {registry.configured()}")
     yield
     checkpoint_task.cancel()
+    ttl_purge_task.cancel()
     try:
         await checkpoint_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    try:
+        await ttl_purge_task
     except (asyncio.CancelledError, Exception):
         pass
     await tracker.stop()

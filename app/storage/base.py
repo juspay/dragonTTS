@@ -11,6 +11,12 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
+def escape_like(literal: str) -> str:
+    """Escape SQLite LIKE wildcards (``%``, ``_``, ``\\``) so a user-supplied
+    substring matches literally. Pair with ``... LIKE ? ESCAPE '\\'``."""
+    return literal.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @dataclass
 class CacheRecord:
     """One cached synthesis result. Metadata lives here; audio bytes in the blob store."""
