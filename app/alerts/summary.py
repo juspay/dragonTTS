@@ -26,9 +26,9 @@ def _pct(num: int, den: int) -> str:
     return f"{round(num * 100 / den)}%"
 
 
-def _money(x: float) -> str:
-    # Sub-dollar daily savings are common — show an extra digit below $1.
-    return f"${x:.2f}" if x >= 1 else f"${x:.3f}"
+def _money(usd: float) -> str:
+    # Display in INR, rounded to the nearest rupee (1 USD = slack_usd_to_inr).
+    return f"₹{round(usd * settings.slack_usd_to_inr):,}"
 
 
 def _human_bytes(n: float) -> str:

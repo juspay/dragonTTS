@@ -151,6 +151,9 @@ spec:
               value: "17:30"
             - name: SLACK_COST_PER_WORD
               value: '{"cartesia":0.000002,"elevenlabs":0.00031,"gemini":0.000293,"sarvam":0.000005}'
+            # USD -> INR for the cost-saved display (rupees, rounded, no paisa).
+            - name: SLACK_USD_TO_INR
+              value: "96"
             # --- Provider credentials ---
             - name: CARTESIA_API_KEY
               value: ""

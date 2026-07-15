@@ -246,6 +246,10 @@ class Settings(BaseSettings):
         # gemini: $0.000293/word (confirm unit). cartesia/sarvam: placeholders.
         "cartesia": 0.000002, "elevenlabs": 0.00031, "gemini": 0.000293, "sarvam": 0.000005,
     })
+    # USD -> INR for the cost-saved DISPLAY (the Slack summary shows rupees,
+    # rounded to the nearest ₹ — no paisa). Rates above stay $/word; only the
+    # shown figure is converted. Adjust if the FX rate drifts.
+    slack_usd_to_inr: float = 96.0
 
     @property
     def configured_providers(self) -> list[str]:
