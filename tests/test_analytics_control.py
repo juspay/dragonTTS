@@ -57,15 +57,15 @@ async def test_daily_stats_shape_and_derived(tmp_storage, monkeypatch):
         )
         conn.execute(
             "INSERT INTO metrics_daily_provider"
-            "(date,provider,requests,hits,misses,synth_calls,bytes_served,words_served) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            ("2026-07-09", "cartesia", 7, 3, 4, 4, 600, 70),
+            "(date,provider,requests,hits,misses,synth_calls,bytes_served,words_served,words_synthesized) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            ("2026-07-09", "cartesia", 7, 3, 4, 4, 600, 70, 28),
         )
         conn.execute(
             "INSERT INTO metrics_daily_provider"
-            "(date,provider,requests,hits,misses,synth_calls,bytes_served,words_served) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            ("2026-07-09", "elevenlabs", 3, 1, 2, 2, 400, 30),
+            "(date,provider,requests,hits,misses,synth_calls,bytes_served,words_served,words_synthesized) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            ("2026-07-09", "elevenlabs", 3, 1, 2, 2, 400, 30, 12),
         )
 
     await meta._run(seed)
@@ -82,8 +82,9 @@ async def test_daily_stats_shape_and_derived(tmp_storage, monkeypatch):
     assert t["words_from_cache_pct"] == 60            # (100-40)/100
     assert set(day["by_provider"]) == {"cartesia", "elevenlabs"}
     assert day["by_provider"]["cartesia"]["hit_rate"] == round(3 / 7, 4)
-    # per-provider rows have no words_synthesized -> no words_from_cache_pct key
-    assert "words_from_cache_pct" not in day["by_provider"]["cartesia"]
+    # per-provider words_synthesized is now persisted -> words_from_cache_pct derived
+    assert day["by_provider"]["cartesia"]["words_from_cache_pct"] == 60  # (70-28)/70
+    assert day["by_provider"]["elevenlabs"]["words_from_cache_pct"] == 60  # (30-12)/30
 
 
 async def test_daily_stats_provider_filter_narrows_totals(tmp_storage, monkeypatch):

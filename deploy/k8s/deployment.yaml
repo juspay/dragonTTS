@@ -50,7 +50,7 @@ spec:
             - name: CACHE_TTL_PER_WORD_SECONDS
               value: "21600"         # +6h per word
             - name: CACHE_TTL_MAX_SECONDS
-              value: "864000"        # 10d cap
+              value: "518400"        # 6d cap
             - name: TTL_PURGE_INTERVAL_SECONDS
               value: "1200"          # purge sweep every 20 min
             # Backfill range for pre-existing NULL-TTL entries (trigger once via
@@ -91,7 +91,7 @@ spec:
               value: '{"cartesia":{"max_concurrent":8,"wait_timeout_ms":3000},"sarvam":{"max_concurrent":8,"wait_timeout_ms":3000},"elevenlabs":{"max_concurrent":8,"wait_timeout_ms":3000}}'
             # --- Predictive warming ---
             - name: PREDICTIVE_WARM_ENABLED
-              value: "true"
+              value: "false"
             - name: PREDICTIVE_WARM_THRESHOLD
               value: "5"
             - name: PREDICTIVE_WARM_THRESHOLD_STEP
@@ -118,9 +118,9 @@ spec:
               value: "0.5"
             # --- Predictive stitching ---
             - name: PREDICTIVE_STITCH_ENABLED
-              value: "true"
+              value: "false"
             - name: PREDICTIVE_STITCH_STREAM_ENABLED
-              value: "true"
+              value: "false"
             - name: PREDICTIVE_STITCH_MIN_COVERAGE
               value: "0.5"
             # Progressive pass-through stitch (opt-in). OFF by default: the
@@ -129,9 +129,23 @@ spec:
             # synthesizes (TTFB ~0). Only fires for pcm_s16le@16k requests with a
             # cached prefix >= PASS_THROUGH_STITCH_MIN_WORDS words.
             - name: ENABLE_PASS_THROUGH_STITCH
-              value: "true"
+              value: "false"
             - name: PASS_THROUGH_STITCH_MIN_WORDS
               value: "2"
+            # --- Slack daily summary ---
+            # SLACK_WEBHOOK_URL is a SECRET — injected via kubectl at deploy time,
+            # never committed (empty here = feature off until set). The other three
+            # are non-secret config. Matches clairvoyance's webhook pattern (same
+            # env-var names). Posts a cache-economics summary daily at
+            # SLACK_SUMMARY_TIME_UTC (17:30 UTC == 11 PM IST) to SLACK_TAG_USERS.
+            - name: SLACK_WEBHOOK_URL
+              value: ""
+            - name: SLACK_TAG_USERS
+              value: "<!subteam^S05KD5LN31Q>"
+            - name: SLACK_SUMMARY_TIME_UTC
+              value: "17:30"
+            - name: SLACK_COST_PER_WORD
+              value: '{"cartesia":0.000002,"elevenlabs":0.00031,"gemini":0.000293,"sarvam":0.000005}'
             # --- Provider credentials ---
             - name: CARTESIA_API_KEY
               value: ""

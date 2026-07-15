@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS metrics_daily_provider (
     synth_calls  INTEGER NOT NULL DEFAULT 0,
     bytes_served INTEGER NOT NULL DEFAULT 0,
     words_served INTEGER NOT NULL DEFAULT 0,
+    words_synthesized INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (date, provider)
 );
 
@@ -83,6 +84,14 @@ CREATE TABLE IF NOT EXISTS latency_samples (
     latency_us  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_latency_kind_date ON latency_samples(kind, date);
+
+-- Once-daily Slack summary coordination across uvicorn workers (DragonTTS has no
+-- Redis, so this table is the shared claim). key='summary_last_post', value =
+-- today's UTC date once a worker has posted. See claim_slack_summary/release.
+CREATE TABLE IF NOT EXISTS slack_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
 
 -- Cache snapshot maintained incrementally so /stats is O(providers), not a
 -- full-table GROUP BY.
@@ -139,7 +148,7 @@ def _word_count_sql(column: str = "text") -> str:
 
 # Columns mirrored into metrics_daily_provider when record_metrics/touch_and_record
 # carry a provider (the per-provider-relevant subset of the daily counters).
-_PROVIDER_COLS = ("requests", "hits", "misses", "synth_calls", "bytes_served", "words_served")
+_PROVIDER_COLS = ("requests", "hits", "misses", "synth_calls", "bytes_served", "words_served", "words_synthesized")
 
 # Idempotent column additions for existing DBs (ALTER ... ADD COLUMN ... DEFAULT 0).
 _METRICS_MIGRATIONS = [
@@ -149,6 +158,11 @@ _METRICS_MIGRATIONS = [
     ("metrics_daily", "stitch_words_assembled INTEGER NOT NULL DEFAULT 0"),
     ("metrics_daily", "stitch_words_synthesized INTEGER NOT NULL DEFAULT 0"),
     ("provider_totals", "total_words INTEGER NOT NULL DEFAULT 0"),
+    # Per-provider words_synthesized (enables per-provider words-from-cache % +
+    # per-provider cost-saved in the Slack summary). The data was already routed
+    # here (every synth-path record_metrics passes provider=), it just wasn't
+    # persisted before this column existed.
+    ("metrics_daily_provider", "words_synthesized INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -674,8 +688,8 @@ class SQLiteMetadataStore:
                 }
             prow = (
                 "SELECT date, provider, requests, hits, misses, synth_calls, "
-                f"bytes_served, words_served FROM metrics_daily_provider{where} "
-                "ORDER BY date, provider"
+                f"bytes_served, words_served, words_synthesized "
+                f"FROM metrics_daily_provider{where} ORDER BY date, provider"
             )
             for r in conn.execute(prow, args):
                 d = r["date"]
@@ -683,7 +697,7 @@ class SQLiteMetadataStore:
                 out[d]["by_provider"][r["provider"]] = {
                     "requests": r["requests"], "hits": r["hits"], "misses": r["misses"],
                     "synth_calls": r["synth_calls"], "bytes_served": r["bytes_served"],
-                    "words_served": r["words_served"],
+                    "words_served": r["words_served"], "words_synthesized": r["words_synthesized"],
                 }
             return out
 
@@ -913,7 +927,8 @@ class SQLiteMetadataStore:
         self, from_date: str | None = None, to_date: str | None = None
     ) -> dict:
         """Per-provider daily rollup: {provider: {requests, hits, misses,
-        synth_calls, bytes_served, words_served, hit_rate}} (day-filtered)."""
+        synth_calls, bytes_served, words_served, words_synthesized, hit_rate}}
+        (day-filtered)."""
         clauses: list[str] = []
         args: list = []
         if from_date:
@@ -928,13 +943,14 @@ class SQLiteMetadataStore:
             rows = conn.execute(
                 "SELECT provider, COALESCE(SUM(requests),0), COALESCE(SUM(hits),0), "
                 "COALESCE(SUM(misses),0), COALESCE(SUM(synth_calls),0), "
-                "COALESCE(SUM(bytes_served),0), COALESCE(SUM(words_served),0) "
+                "COALESCE(SUM(bytes_served),0), COALESCE(SUM(words_served),0), "
+                "COALESCE(SUM(words_synthesized),0) "
                 f"FROM metrics_daily_provider{where} GROUP BY provider",
                 args,
             ).fetchall()
             out: dict[str, dict] = {}
             for r in rows:
-                prov, requests, hits, misses, synth_calls, bytes_served, words_served = r
+                prov, requests, hits, misses, synth_calls, bytes_served, words_served, words_synthesized = r
                 out[prov] = {
                     "requests": requests,
                     "hits": hits,
@@ -942,11 +958,52 @@ class SQLiteMetadataStore:
                     "synth_calls": synth_calls,
                     "bytes_served": bytes_served,
                     "words_served": words_served,
+                    "words_synthesized": words_synthesized,
                     "hit_rate": round(hits / requests, 4) if requests else None,
                 }
             return out
 
         return await self._run(_q)
+
+    async def claim_slack_summary(self, today: str) -> bool:
+        """Atomically claim today's daily-summary slot. Returns True if this
+        caller wins (first to post today); False if another worker already
+        claimed it. The claim key is the UTC date string, so it's once-per-day.
+        On a Slack send failure the caller should :meth:`release_slack_summary`
+        so a later tick retries.
+
+        Safe across the N uvicorn workers via ``BEGIN IMMEDIATE``: the first
+        worker to commit the UPDATE wins (rowcount 1); concurrent callers then
+        see ``value == today`` and get rowcount 0.
+        """
+        def _c(conn: sqlite3.Connection) -> bool:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO slack_state(key, value) "
+                    "VALUES('summary_last_post', '')"
+                )
+                cur = conn.execute(
+                    "UPDATE slack_state SET value=? "
+                    "WHERE key='summary_last_post' AND value<?",
+                    (today, today),
+                )
+                conn.execute("COMMIT")
+                return cur.rowcount == 1
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+        return await self._run(_c)
+
+    async def release_slack_summary(self) -> None:
+        """Clear today's claim (e.g. after a Slack send failure) so a later tick
+        retries. Idempotent."""
+        def _r(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE slack_state SET value='' WHERE key='summary_last_post'"
+            )
+        await self._run(_r)
 
     async def latency_summary(
         self, from_date: str | None = None, to_date: str | None = None

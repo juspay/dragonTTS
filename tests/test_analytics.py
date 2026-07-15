@@ -102,7 +102,7 @@ async def test_per_provider_rollup(tmp_storage):
     pm = await meta.provider_metrics_summary()
     assert pm["cartesia"] == {
         "requests": 1, "hits": 1, "misses": 0, "synth_calls": 0,
-        "bytes_served": 0, "words_served": 5, "hit_rate": 1.0,
+        "bytes_served": 0, "words_served": 5, "words_synthesized": 0, "hit_rate": 1.0,
     }
     assert pm["sarvam"]["misses"] == 1 and pm["sarvam"]["synth_calls"] == 1
     assert pm["sarvam"]["hit_rate"] == 0.0
@@ -111,7 +111,8 @@ async def test_per_provider_rollup(tmp_storage):
 # --- stitch analytics --------------------------------------------------
 
 
-async def test_stitch_records_metrics(svc):
+async def test_stitch_records_metrics(svc, monkeypatch):
+    monkeypatch.setattr(settings, "predictive_stitch_enabled", True)  # off by default now
     # Seed a substring-closed prefix chain so stitch's binary search finds the
     # cached prefix (stitch assumes monotonicity under substring closure — if
     # "how are you" is cached, "how" and "how are" must be too).

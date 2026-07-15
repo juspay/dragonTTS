@@ -1341,8 +1341,8 @@ class CacheService:
     @staticmethod
     def _derive(m: dict) -> dict:
         """Add hit_rate (+ words_from_cache_pct, stitch_coverage_avg when the
-        raw sums exist) to a metrics map. Per-provider rows lack
-        words_synthesized/stitch, so only hit_rate is added there."""
+        raw sums exist) to a metrics map. Per-provider rows now carry
+        words_synthesized, so words_from_cache_pct is derived for them too."""
         out = dict(m)
         req = m.get("requests", 0)
         out["hit_rate"] = round(m["hits"] / req, 4) if req else None

@@ -276,7 +276,7 @@ Set in `deploy/k8s/deployment.yaml`. Non-secret — safe to commit.
 |---|---|---|
 | `CACHE_TTL_BASE_SECONDS` | `172800` (48h) | min TTL for any phrase |
 | `CACHE_TTL_PER_WORD_SECONDS` | `21600` (+6h) | added per word |
-| `CACHE_TTL_MAX_SECONDS` | `864000` (10d) | cap |
+| `CACHE_TTL_MAX_SECONDS` | `518400` (6d) | cap |
 | `TTL_PURGE_INTERVAL_SECONDS` | `1200` (20m) | purge sweep cadence |
 | `CACHE_TTL_BACKFILL_MIN_HOURS` | `48` | backfill random-TTL lower bound |
 | `CACHE_TTL_BACKFILL_MAX_HOURS` | `72` | backfill random-TTL upper bound |

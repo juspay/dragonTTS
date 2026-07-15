@@ -7,6 +7,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
+from app.alerts.summary import send_daily_summary
 from app.audio.format import content_type_for
 from app.schemas.cache import CacheEntryInfo, PaginatedCache
 
@@ -183,6 +184,16 @@ async def backfill_ttl(request: Request):
     cache = request.app.state.cache
     count = await cache.backfill_missing_ttl()
     return {"status": "backfilled", "updated": count}
+
+
+@router.post("/slack-summary")
+async def slack_summary(request: Request):
+    """Force-send the daily Slack cache summary now — bypasses the time gate and
+    the once-per-day claim. Use to test the message or recover a missed day. A
+    missing webhook URL is a no-op (returns ``sent=false``)."""
+    cache = request.app.state.cache
+    sent = await send_daily_summary(cache, force=True)
+    return {"sent": sent}
 
 
 @router.get("/cache/{key}")

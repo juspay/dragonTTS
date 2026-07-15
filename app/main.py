@@ -102,16 +102,35 @@ async def lifespan(app: FastAPI):
 
     ttl_purge_task = asyncio.create_task(_ttl_purge_loop())
 
+    # Once-daily Slack cache-economics summary (overall + per-provider hit rate,
+    # words-from-cache %, est. cost saved) at slack_summary_time_utc. Webhook
+    # absent => feature off (send_daily_summary is a no-op). Never fatal.
+    async def _slack_summary_loop():
+        while True:
+            await asyncio.sleep(settings.slack_summary_tick_seconds)
+            try:
+                from app.alerts.summary import send_daily_summary
+                await send_daily_summary(cache)
+            except Exception as e:
+                logger.debug(f"Slack summary tick failed: {e}")
+
+    slack_summary_task = asyncio.create_task(_slack_summary_loop())
+
     logger.info(f"DragonTTS ready — providers: {registry.configured()}")
     yield
     checkpoint_task.cancel()
     ttl_purge_task.cancel()
+    slack_summary_task.cancel()
     try:
         await checkpoint_task
     except (asyncio.CancelledError, Exception):
         pass
     try:
         await ttl_purge_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    try:
+        await slack_summary_task
     except (asyncio.CancelledError, Exception):
         pass
     await tracker.stop()

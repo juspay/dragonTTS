@@ -88,7 +88,7 @@ class Settings(BaseSettings):
     # ttl_seconds knob below, which is kept only for back-compat.
     cache_ttl_base_seconds: int = 172800  # 48h floor — min TTL for any phrase
     cache_ttl_per_word_seconds: int = 21600  # +6h per word
-    cache_ttl_max_seconds: int = 864000  # 10d cap
+    cache_ttl_max_seconds: int = 518400  # 6d cap
     ttl_purge_interval_seconds: int = 1200  # purge sweep cadence (20 min)
     # Backfill for pre-existing entries (ttl_expires_at IS NULL, e.g. created
     # before this feature under ttl_seconds=0). At startup each NULL row gets a
@@ -159,7 +159,7 @@ class Settings(BaseSettings):
     # --- Predictive cache warming (Part 1: frequency-based auto-warm) ---
     # Tracks recurring phrase substrings across requests and warms the frequent
     # ones into the cache so Part 2 (segment + stitch) can assemble them.
-    predictive_warm_enabled: bool = True
+    predictive_warm_enabled: bool = False  # off by default (stitch/warm retired; write-through only)
     # Length-scaled warm threshold. A short phrase (e.g. "hi") is a substring of
     # many longer ones, so its decayed count is the sum of all of them — it
     # would dominate warming and cache trivial fragments. Longer phrases are the
@@ -193,7 +193,7 @@ class Settings(BaseSettings):
     # --- Predictive stitching (Part 2: serve a MISS from cached sub-phrases) ---
     # On a full-text MISS, binary-search cached prefix/suffix, synth only the
     # gaps, cross-fade at seams. Skipped below the coverage gate.
-    predictive_stitch_enabled: bool = True
+    predictive_stitch_enabled: bool = False  # off by default (retired; re-enable per-env to revive)
     # Stitch a MISS from cached sub-phrases when at least this fraction is cached
     # (miss <= 1 - this). Default 0.25 = latency-favored (stitch when miss < 75%):
     # the gap synth is <=75% of the phrase so it still beats a full synth on the
@@ -206,7 +206,7 @@ class Settings(BaseSettings):
     # Independent of the one-shot flag: live streaming has lower TTFB, so this is
     # the trade of "first request waits for gap-synth + assembly" vs "reuse cached
     # sub-phrases and cache the assembled clip for instant repeat HITs".
-    predictive_stitch_stream_enabled: bool = True
+    predictive_stitch_stream_enabled: bool = False  # off by default (stitch retired)
     # --- Progressive pass-through stitch (opt-in /tts/stream path) ---
     # When true AND /tts/stream is a stitchable MISS with a cached PREFIX (>= the
     # min-words gate below) AND the requested format == native pcm_s16le@16k,
@@ -216,7 +216,7 @@ class Settings(BaseSettings):
     # byte unchanged, and on any ineligibility/error this falls back to it.
     # Mid-utterance pause remains for later gaps (only live gap-streaming removes
     # it) -- this only fixes the START (perceptually-important) latency.
-    enable_pass_through_stitch: bool = True
+    enable_pass_through_stitch: bool = False
     # Minimum cached-prefix word count to use the pass-through path. Below this
     # (or no cached prefix before the first gap) it falls back to the assemble
     # path (a 1-2 word prefix isn't worth streaming early).
@@ -228,6 +228,24 @@ class Settings(BaseSettings):
     predictive_stitch_sil_relative_db: float = 25.0 # silence gate: a window this many dB below the clip peak is trimmed (HIGHER = more aggressive gap cutting)
     predictive_stitch_sil_guard_ms: float = 3.0     # sliver kept at each trimmed edge so onsets/offsets survive
     predictive_stitch_zc_search_ms: float = 4.0     # window scanned for a zero crossing to anchor each splice (avoids clicks)
+
+    # --- Slack daily summary (mirrors clairvoyance's incoming-webhook pattern) ---
+    # Off by default: an empty SLACK_WEBHOOK_URL disables the feature (no separate
+    # flag, matching clairvoyance). When set, a background task posts a daily
+    # cache-economics summary (hit rate, words-from-cache %, est. cost saved —
+    # overall + per provider) at slack_summary_time_utc. Never affects serving.
+    slack_webhook_url: str = ""
+    slack_tag_users: str = "<!subteam^S05KD5LN31Q>"  # comma-separated handles/groups to cc (default: Breeze Sentinels)
+    slack_summary_time_utc: str = "17:30"    # daily post time (17:30 UTC == 11 PM IST)
+    slack_summary_tick_seconds: int = 300    # how often the background loop checks the clock
+    # Per-provider $/word for the estimated-cost-saved figure (JSON env map).
+    # cost_saved(provider) = words_from_cache(provider) * rate(provider); total = sum.
+    # Placeholder rates — calibrate SLACK_COST_PER_WORD to your blended provider pricing.
+    slack_cost_per_word: dict = Field(default_factory=lambda: {
+        # $/word, from dashboard billing. elevenlabs: $70.36/1.36M chars (~6 c/w).
+        # gemini: $0.000293/word (confirm unit). cartesia/sarvam: placeholders.
+        "cartesia": 0.000002, "elevenlabs": 0.00031, "gemini": 0.000293, "sarvam": 0.000005,
+    })
 
     @property
     def configured_providers(self) -> list[str]:
