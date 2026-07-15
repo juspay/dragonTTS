@@ -236,7 +236,7 @@ class Settings(BaseSettings):
     # overall + per provider) at slack_summary_time_utc. Never affects serving.
     slack_webhook_url: str = ""
     slack_tag_users: str = "<!subteam^S05KD5LN31Q>"  # comma-separated handles/groups to cc (default: Breeze Sentinels)
-    slack_summary_time_utc: str = "17:30"    # daily post time (17:30 UTC == 11 PM IST)
+    slack_summary_time_utc: str = "16:30"    # daily post time (16:30 UTC == 10 PM IST)
     slack_summary_tick_seconds: int = 300    # how often the background loop checks the clock
     # Per-provider $/word for the estimated-cost-saved figure (JSON env map).
     # cost_saved(provider) = words_from_cache(provider) * rate(provider); total = sum.

@@ -63,7 +63,7 @@ async def build_summary(cache) -> dict:
 
     rates = settings.slack_cost_per_word or {}
     total_cost = 0.0
-    sections: list[str] = []
+    sections: list[dict] = []
     for prov, pm in sorted(providers.items()):
         p_req = pm.get("requests", 0)
         p_hits = pm.get("hits", 0)
@@ -72,12 +72,15 @@ async def build_summary(cache) -> dict:
         p_wfc = max(0, p_wserved - p_wsyn)
         cost = p_wfc * float(rates.get(prov, 0.0))
         total_cost += cost
-        sections.append(
-            f"*{prov}*\n"
-            f"hit rate: {_pct(p_hits, p_req)} ({p_hits:,} / {p_req:,})\n"
-            f"words from cache: {_pct(p_wfc, p_wserved)} ({p_wfc:,} / {p_wserved:,})\n"
-            f"cost saved: {_money(cost)}"
-        )
+        sections.append({
+            "title": prov,
+            "text": (
+                f"• hit rate: *{_pct(p_hits, p_req)}* ({p_hits:,} / {p_req:,})\n"
+                f"• words from cache: *{_pct(p_wfc, p_wserved)}* "
+                f"({p_wfc:,} / {p_wserved:,})\n"
+                f"• cost saved: *{_money(cost)}*"
+            ),
+        })
 
     fields = [
         {
@@ -89,28 +92,31 @@ async def build_summary(cache) -> dict:
             "value": f"{_pct(words_from_cache, words_served)} "
                      f"({words_from_cache:,} / {words_served:,})",
         },
-        {"name": "Est. cost saved", "value": f"{_money(total_cost)} (Σ providers)"},
+        {"name": "Est. cost saved", "value": f"{_money(total_cost)} (all providers)"},
         {"name": "Window", "value": f"{from_date} → {to_date} (UTC)"},
     ]
 
     # Cache snapshot + PVC usage (last section).
     entries = snap.get("entries", 0)
     total_bytes = snap.get("total_bytes", 0)
-    pvc = ""
     try:
         du = shutil.disk_usage(settings.db_path)
         used_pct = round(du.used * 100 / du.total) if du.total else 0
-        pvc = (
-            f" · PVC {_human_bytes(du.used)} / {_human_bytes(du.total)} ({used_pct}%)"
-        )
+        pvc = f"{_human_bytes(du.used)} / {_human_bytes(du.total)} ({used_pct}%)"
     except Exception:
-        pass
-    sections.append(
-        f"Cache: {entries:,} entries · {_human_bytes(total_bytes)}{pvc}"
-    )
+        pvc = "—"
+    sections.append({
+        "title": "Cache",
+        "text": (
+            f"• entries: *{entries:,}*\n"
+            f"• size: *{_human_bytes(total_bytes)}*\n"
+            f"• PVC: *{pvc}*"
+        ),
+    })
 
+    display_date = datetime.now(timezone.utc).strftime("%d-%m-%y")
     return {
-        "title": "📊 DragonTTS — Daily Cache Summary",
+        "title": f"📊 DragonTTS Daily Cache Summary - {display_date}",
         "fields": fields,
         "sections": sections,
         "fallback_text": (

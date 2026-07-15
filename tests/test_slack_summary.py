@@ -119,14 +119,16 @@ async def test_build_summary_overall_and_per_provider(tmp_storage, fake_provider
     # total cost = gemini 0.015 + elevenlabs 0.010 = 0.025 USD -> x96 = 2.4 -> ₹2
     assert "₹2" in field_map["Est. cost saved"]
 
-    # per-provider sections (alphabetical) + one cache section.
+    # per-provider sections (alphabetical) + one cache section, each a titled dict.
     assert len(payload["sections"]) == 3
-    assert payload["sections"][0].startswith("*elevenlabs*")
-    assert payload["sections"][1].startswith("*gemini*")
+    assert payload["sections"][0]["title"] == "elevenlabs"
+    assert payload["sections"][1]["title"] == "gemini"
+    assert payload["sections"][2]["title"] == "Cache"
     # elevenlabs: 0.010*96 = 0.96 -> ₹1 ; gemini: 0.015*96 = 1.44 -> ₹1
-    assert "₹1" in payload["sections"][0]
-    assert "₹1" in payload["sections"][1]
-    assert payload["sections"][2].startswith("Cache:")  # snapshot + PVC
+    assert "₹1" in payload["sections"][0]["text"]
+    assert "₹1" in payload["sections"][1]["text"]
+    assert "all providers" in field_map["Est. cost saved"]
+    assert payload["title"].startswith("📊 DragonTTS Daily Cache Summary")
 
 
 # --- send_daily_summary gate + force -----------------------------------------

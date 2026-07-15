@@ -55,10 +55,15 @@ class Alert:
                     for f in fields
                 ],
             })
-        # Each section is its own block — a plain mrkdwn string (used for the
-        # per-provider breakdown) or a {name, text} dict ("*name:*\ntext").
+        # Each section is its own block — a plain mrkdwn string, or a
+        # {title/name, text} dict rendered as a bold sub-heading + body
+        # (mirrors clairvoyance's summary sections).
         for s in sections or []:
-            text = s if isinstance(s, str) else f"*{s.get('name', '')}:*\n{s.get('text', '')}"
+            if isinstance(s, str):
+                text = s
+            else:
+                head = s.get("title") or s.get("name", "")
+                text = f"*{head}:*\n{s.get('text', '')}" if head else s.get("text", "")
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
         for link in links or []:
             url = link.get("url", "")
