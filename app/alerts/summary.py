@@ -85,12 +85,12 @@ async def build_summary(cache) -> dict:
     fields = [
         {
             "name": "Cache hit rate",
-            "value": f"{_pct(hits, requests)} ({hits:,} / {requests:,})",
+            "value": f"{_pct(hits, requests)} ({hits:,} / {requests:,} requests)",
         },
         {
             "name": "Words from cache",
             "value": f"{_pct(words_from_cache, words_served)} "
-                     f"({words_from_cache:,} / {words_served:,})",
+                     f"({words_from_cache:,} / {words_served:,} words)",
         },
         {"name": "Est. cost saved", "value": f"{_money(total_cost)} (all providers)"},
         {"name": "Window", "value": f"{from_date} → {to_date} (UTC)"},
