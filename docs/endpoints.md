@@ -311,7 +311,7 @@ Set in `deploy/k8s/deployment.yaml`. Non-secret — safe to commit.
 ### Metrics
 | Env | Prod | Purpose |
 |---|---|---|
-| `METRICS_LATENCY_SAMPLE_RATE` | `0.4` | fraction of requests timed |
+| `METRICS_LATENCY_SAMPLE_RATE` | `0.3` | fraction of requests timed |
 | `METRICS_LATENCY_RETENTION_DAYS` | `14` | prune `latency_samples` older than this |
 
 > **Credentials are never in the manifest** — provider keys are injected at

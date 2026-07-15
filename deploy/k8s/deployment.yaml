@@ -136,7 +136,7 @@ spec:
             # Fraction of requests timed for the latency rollup (0.4 = 40%).
             # Higher = more samples -> more stable p95; cost is negligible.
             - name: METRICS_LATENCY_SAMPLE_RATE
-              value: "0.4"
+              value: "0.3"
             # --- Slack daily summary ---
             # SLACK_WEBHOOK_URL is a SECRET — injected via kubectl at deploy time,
             # never committed (empty here = feature off until set). The other three
