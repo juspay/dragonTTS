@@ -152,7 +152,7 @@ class Settings(BaseSettings):
     metrics_flush_batch_size: int = 64
     # Latency sampling: fraction of requests timed for the avg/p95 rollup (0
     # disables). perf_counter is cheap; sampling bounds latency_samples growth.
-    metrics_latency_sample_rate: float = 0.1
+    metrics_latency_sample_rate: float = 0.4  # fraction of requests timed for the latency rollup
     # latency_samples rows older than this are pruned by the periodic checkpoint
     # loop, keeping the table bounded.
     metrics_latency_retention_days: int = 14
