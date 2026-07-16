@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DragonTTS — Signal Lab</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600;12..96,700;12..96,800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#0a0b0e; --ink-2:#0d0f14; --panel:#12141b; --panel-2:#171a22;
+    --line:rgba(255,255,255,.08); --line-2:rgba(255,255,255,.14);
+    --text:#e8eaf0; --muted:#8a90a0; --dim:#5b6173;
+    --lime:#c8f94e; --lime-dim:#7f9a2c; --amber:#ffb454; --cyan:#5ed3f3; --rose:#ff6b6b; --violet:#b69bff;
+    --mono:'JetBrains Mono',ui-monospace,monospace;
+    --display:'Bricolage Grotesque',system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--ink); color:var(--text);
+    font-family:var(--display); font-weight:400; line-height:1.55;
+    -webkit-font-smoothing:antialiased; overflow-x:hidden;
+  }
+  /* atmosphere: grid + glow + grain */
+  body::before{
+    content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+    background:
+      radial-gradient(900px 500px at 78% -8%, rgba(200,249,78,.10), transparent 60%),
+      radial-gradient(700px 500px at 8% 8%, rgba(94,211,243,.07), transparent 60%),
+      linear-gradient(transparent 95%, rgba(255,255,255,.035) 95%),
+      linear-gradient(90deg, transparent 95%, rgba(255,255,255,.035) 95%);
+    background-size:auto,auto,26px 26px,26px 26px;
+  }
+  body::after{
+    content:""; position:fixed; inset:0; z-index:0; pointer-events:none; opacity:.5;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitch='stitch'/><feColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 .05 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+    mix-blend-mode:overlay;
+  }
+  .wrap{position:relative; z-index:1; max-width:1240px; margin:0 auto; padding:0 28px}
+
+  /* ---------- top bar ---------- */
+  header.bar{
+    position:sticky; top:0; z-index:20; backdrop-filter:blur(12px);
+    background:linear-gradient(180deg, rgba(10,11,14,.92), rgba(10,11,14,.55));
+    border-bottom:1px solid var(--line);
+  }
+  .bar-inner{display:flex; align-items:center; gap:22px; height:62px}
+  .mark{display:flex; align-items:center; gap:11px; font-family:var(--mono); font-weight:700; letter-spacing:-.01em; font-size:15px}
+  .glyph{width:26px; height:26px; position:relative; display:grid; place-items:center}
+  .glyph i{position:absolute; inset:0; border:1.5px solid var(--lime); border-radius:7px; transform:rotate(45deg)}
+  .glyph b{position:absolute; width:8px;height:8px;background:var(--lime);border-radius:50%; box-shadow:0 0 12px var(--lime)}
+  .mark span{color:var(--muted); font-weight:500}
+  nav.links{display:flex; gap:4px; margin-left:auto; font-family:var(--mono); font-size:12.5px}
+  nav.links a{color:var(--muted); text-decoration:none; padding:7px 11px; border-radius:7px; transition:.18s; letter-spacing:.02em}
+  nav.links a:hover{color:var(--text); background:var(--panel)}
+  .live{display:flex; align-items:center; gap:8px; font-family:var(--mono); font-size:11.5px; color:var(--muted); letter-spacing:.06em; text-transform:uppercase}
+  .pulse{width:8px;height:8px;border-radius:50%;background:var(--lime); box-shadow:0 0 0 0 rgba(200,249,78,.6); animation:pulse 2s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(200,249,78,.55)}70%{box-shadow:0 0 0 9px rgba(200,249,78,0)}100%{box-shadow:0 0 0 0 rgba(200,249,78,0)}}
+
+  /* ---------- hero ---------- */
+  .hero{padding:78px 0 40px; position:relative}
+  .hero canvas{position:absolute; left:50%; top:46%; transform:translate(-50%,-50%); width:720px; max-width:120%; height:230px; opacity:.5; z-index:-1; pointer-events:none}
+  .kicker{font-family:var(--mono); font-size:12px; letter-spacing:.34em; text-transform:uppercase; color:var(--lime); margin:0 0 18px; display:flex; align-items:center; gap:12px}
+  .kicker::before{content:""; width:34px; height:1px; background:var(--lime)}
+  h1{font-family:var(--display); font-weight:800; font-size:clamp(48px,9vw,104px); line-height:.92; letter-spacing:-.04em; margin:0}
+  h1 .alt{font-family:var(--display); font-style:italic; font-weight:500; color:var(--lime)}
+  .lede{max-width:560px; color:var(--muted); font-size:18px; margin:22px 0 0; font-weight:400}
+  .lede b{color:var(--text); font-weight:600}
+  .chips{display:flex; flex-wrap:wrap; gap:10px; margin-top:30px}
+  .chip{font-family:var(--mono); font-size:12px; padding:7px 13px; border:1px solid var(--line-2); border-radius:999px; color:var(--muted); display:flex; align-items:center; gap:8px; background:rgba(255,255,255,.02)}
+  .chip i{width:6px;height:6px;border-radius:50%}
+  .c-lime i{background:var(--lime)} .c-amber i{background:var(--amber)} .c-cyan i{background:var(--cyan)} .c-rose i{background:var(--rose)}
+
+  /* ---------- section ---------- */
+  section{padding:64px 0; border-top:1px solid var(--line)}
+  .shead{display:flex; align-items:baseline; gap:16px; margin-bottom:30px}
+  .snum{font-family:var(--mono); font-size:12px; color:var(--dim); letter-spacing:.1em}
+  h2{font-family:var(--display); font-weight:700; font-size:clamp(26px,4vw,38px); letter-spacing:-.025em; margin:0}
+  .ssub{color:var(--muted); max-width:620px; margin:-16px 0 26px; font-size:15px}
+
+  /* ---------- signal flow ---------- */
+  .flow{position:relative; border:1px solid var(--line); border-radius:18px; background:linear-gradient(180deg,var(--panel),var(--ink-2)); padding:38px 26px; overflow:hidden}
+  .flow::before{content:""; position:absolute; inset:0; background:radial-gradient(600px 200px at 50% 0, rgba(200,249,78,.05), transparent 70%); pointer-events:none}
+  .lanes{display:grid; grid-template-columns:1fr; gap:18px; position:relative}
+  .lane{display:flex; align-items:center; gap:0; flex-wrap:wrap}
+  .node{font-family:var(--mono); font-size:12px; padding:11px 15px; border:1px solid var(--line-2); border-radius:10px; background:var(--panel-2); white-space:nowrap; position:relative; z-index:2}
+  .node .lbl{color:var(--dim); font-size:10px; letter-spacing:.08em; text-transform:uppercase; display:block; margin-bottom:3px}
+  .node .v{color:var(--text); font-weight:600}
+  .node.hero-n{border-color:rgba(200,249,78,.4); box-shadow:0 0 0 1px rgba(200,249,78,.08), 0 0 30px rgba(200,249,78,.06)}
+  .wire{flex:1; min-width:34px; height:1px; background:repeating-linear-gradient(90deg,var(--line-2) 0 6px, transparent 6px 12px); position:relative}
+  .fork{display:grid; gap:16px; flex:1}
+  .branch{display:flex; align-items:center; gap:0}
+  .tag{font-family:var(--mono); font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; padding:4px 9px; border-radius:6px; border:1px solid var(--line-2)}
+  .tag.hit{color:var(--lime); border-color:rgba(200,249,78,.4); background:rgba(200,249,78,.07)}
+  .tag.miss{color:var(--rose); border-color:rgba(255,107,107,.4); background:rgba(255,107,107,.06)}
+  .providers{display:flex; gap:8px; flex-wrap:wrap}
+  .pv{font-family:var(--mono); font-size:11px; color:var(--muted); border:1px solid var(--line); border-radius:7px; padding:5px 9px; background:var(--ink-2)}
+  /* the traveling packet */
+  .packet{position:absolute; top:0; left:0; width:9px; height:9px; border-radius:50%; background:var(--lime); box-shadow:0 0 14px var(--lime),0 0 4px #fff; z-index:3; offset-path:path("M 60 22 H 230 H 360"); offset-rotate:0deg; animation:ride 5.2s infinite ease-in-out; opacity:0}
+  @keyframes ride{0%{offset-distance:0%;opacity:0}8%{opacity:1}48%{offset-distance:46%}52%{offset-distance:46%;opacity:1}92%{offset-distance:100%;opacity:1}100%{offset-distance:100%;opacity:0}}
+
+  /* ---------- metrics ---------- */
+  .metrics{display:grid; grid-template-columns:repeat(12,1fr); gap:16px}
+  .metric{border:1px solid var(--line); border-radius:16px; background:var(--panel); padding:22px 22px 20px; position:relative; overflow:hidden}
+  .metric .mlbl{font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted)}
+  .metric .mval{font-family:var(--display); font-weight:700; font-size:clamp(34px,5vw,52px); letter-spacing:-.03em; line-height:1.05; margin-top:10px}
+  .metric .munit{font-family:var(--mono); font-size:13px; color:var(--muted); margin-top:6px}
+  .m-hit{grid-column:span 4} .m-words{grid-column:span 4} .m-cost{grid-column:span 4}
+  .m-entries{grid-column:span 6} .m-pvc{grid-column:span 6}
+  .m-cost .mval{color:var(--amber)}
+  .m-hit .mval{color:var(--lime)}
+  /* VU meter */
+  .vu{display:flex; align-items:flex-end; gap:3px; height:30px; margin-top:14px}
+  .vu i{flex:1; background:var(--line-2); border-radius:2px; transition:.3s}
+  .vu i.on{background:var(--lime); box-shadow:0 0 8px rgba(200,249,78,.5)}
+  /* PVC bar */
+  .bartrack{height:9px; border-radius:6px; background:var(--ink-2); border:1px solid var(--line); margin-top:14px; overflow:hidden; position:relative}
+  .barfill{height:100%; width:0; background:linear-gradient(90deg,var(--cyan),var(--lime)); border-radius:6px; transition:width 1.4s cubic-bezier(.2,.8,.2,1)}
+  .bartrack::after{content:""; position:absolute; inset:0; background:repeating-linear-gradient(90deg,transparent 0 calc(10% - 1px), rgba(0,0,0,.4) calc(10% - 1px) 10%); pointer-events:none}
+  .twocol{display:grid; grid-template-columns:1fr 1fr; gap:0 38px; margin-top:6px}
+
+  /* ---------- providers ---------- */
+  .prov-grid{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+  .pcard{border:1px solid var(--line); border-radius:14px; background:var(--panel); padding:20px}
+  .pcard h3{margin:0 0 4px; font-family:var(--mono); font-size:13px; letter-spacing:.04em; display:flex; align-items:center; gap:9px}
+  .pcard h3 i{width:9px;height:9px;border-radius:2px}
+  .pcard .row{display:flex; justify-content:space-between; align-items:baseline; padding:9px 0; border-bottom:1px dashed var(--line); font-family:var(--mono); font-size:13px}
+  .pcard .row:last-child{border-bottom:none}
+  .pcard .row span{color:var(--muted)}
+  .pcard .row b{color:var(--text); font-weight:600}
+  .pcard .hitline{height:5px; border-radius:4px; background:var(--ink-2); margin:12px 0 4px; overflow:hidden}
+  .pcard .hitline i{display:block; height:100%; width:0; border-radius:4px; transition:width 1.3s cubic-bezier(.2,.8,.2,1)}
+
+  /* ---------- cache policy timeline ---------- */
+  .policy{display:grid; grid-template-columns:1.1fr .9fr; gap:30px; align-items:start}
+  .ttl{border:1px solid var(--line); border-radius:14px; background:var(--panel); padding:24px}
+  .scale{position:relative; height:64px; margin:18px 0 8px}
+  .scale .track{position:absolute; left:0; right:0; top:30px; height:6px; border-radius:5px; background:linear-gradient(90deg,var(--lime-dim),var(--lime)); border:1px solid var(--line)}
+  .scale .cap{position:absolute; top:24px; right:0; width:2px; height:18px; background:var(--amber)}
+  .scale .lo,.scale .hi{position:absolute; top:0; font-family:var(--mono); font-size:11px; color:var(--muted)}
+  .scale .lo{left:0} .scale .hi{right:0; transform:translateX(0)}
+  .scale .words{position:absolute; bottom:0; font-family:var(--mono); font-size:10.5px; color:var(--dim)}
+  .feats{display:grid; gap:10px}
+  .feat{display:flex; gap:12px; align-items:flex-start; padding:14px 16px; border:1px solid var(--line); border-radius:11px; background:var(--panel)}
+  .feat .dot{width:9px;height:9px;border-radius:50%; margin-top:5px; flex:none}
+  .feat.on .dot{background:var(--lime); box-shadow:0 0 8px var(--lime)}
+  .feat.off .dot{background:var(--dim)}
+  .feat h4{margin:0; font-family:var(--mono); font-size:12.5px; font-weight:600}
+  .feat.off h4{color:var(--muted)}
+  .feat p{margin:3px 0 0; font-size:13px; color:var(--muted)}
+
+  /* ---------- slack card ---------- */
+  .card-stage{display:grid; grid-template-columns:1fr 1fr; gap:34px; align-items:center}
+  .slack{background:#fff; color:#1d1c1d; border-radius:12px; padding:18px 18px 8px; font-family:'JetBrains Mono',monospace; font-size:13px; box-shadow:0 30px 70px -20px rgba(0,0,0,.7), 0 2px 0 rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.06); position:relative; transform:rotate(-.6deg)}
+  .slack .sh{font-weight:700; font-size:15px; margin-bottom:12px}
+  .slack .grid{display:grid; grid-template-columns:1fr 1fr; gap:10px 24px; margin-bottom:14px}
+  .slack .grid div{border-top:1px solid #f0f0f0; padding-top:8px}
+  .slack .grid b{display:block; color:#7a7a7a; font-weight:600; font-size:11px; margin-bottom:2px}
+  .slack .psec{border-top:1px solid #f0f0f0; padding:10px 0 6px}
+  .slack .psec h5{margin:0 0 6px; font-size:13px; font-weight:700}
+  .slack .psec p{margin:0 0 3px; color:#1d1c1d}
+  .slack .cc{border-top:1px solid #f0f0f0; padding:10px 0 12px; color:#1d1c1d}
+  .slack .cc b{color:#1264a3}
+  .slack .tag-rupee{color:#6a1b9a; font-weight:700}
+  .card-copy h3{font-family:var(--display); font-weight:700; font-size:22px; letter-spacing:-.02em; margin:0 0 10px}
+  .card-copy p{color:var(--muted); margin:0 0 12px; font-size:14.5px}
+  .card-copy ul{margin:0; padding:0; list-style:none}
+  .card-copy li{font-family:var(--mono); font-size:12.5px; color:var(--muted); padding:6px 0; border-bottom:1px dashed var(--line); display:flex; gap:10px}
+  .card-copy li::before{content:"›"; color:var(--lime)}
+
+  /* ---------- config table ---------- */
+  .cfg{font-family:var(--mono); font-size:12.5px; border:1px solid var(--line); border-radius:14px; overflow:hidden}
+  .cfg .row{display:grid; grid-template-columns:1.3fr .8fr 2fr; gap:18px; padding:13px 18px; border-bottom:1px solid var(--line); align-items:center}
+  .cfg .row:last-child{border-bottom:none}
+  .cfg .row.h{background:var(--panel-2); color:var(--dim); font-size:11px; letter-spacing:.08em; text-transform:uppercase}
+  .cfg .k{color:var(--text)} .cfg .v{color:var(--lime)} .cfg .v.warn{color:var(--amber)} .cfg .d{color:var(--muted)}
+
+  /* ---------- footer ---------- */
+  footer{padding:54px 0 80px; border-top:1px solid var(--line); color:var(--dim); font-family:var(--mono); font-size:12px; display:flex; justify-content:space-between; flex-wrap:wrap; gap:14px}
+  footer a{color:var(--muted); text-decoration:none}
+  footer a:hover{color:var(--lime)}
+
+  /* reveal */
+  .reveal{opacity:0; transform:translateY(18px); transition:opacity .7s ease, transform .7s cubic-bezier(.2,.8,.2,1)}
+  .reveal.in{opacity:1; transform:none}
+
+  @media(max-width:900px){
+    .m-hit,.m-words,.m-cost{grid-column:span 12}
+    .m-entries,.m-pvc{grid-column:span 12}
+    .policy,.card-stage,.prov-grid{grid-template-columns:1fr}
+    .cfg .row{grid-template-columns:1fr; gap:4px}
+  }
+  @media(prefers-reduced-motion:reduce){
+    *{animation:none!important; transition:none!important}
+    .reveal{opacity:1; transform:none}
+  }
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <div class="wrap bar-inner">
+    <div class="mark"><span class="glyph"><i></i><b></b></span> DragonTTS <span>// signal lab</span></div>
+    <nav class="links">
+      <a href="#flow">flow</a><a href="#metrics">metrics</a><a href="#providers">providers</a><a href="#policy">cache</a><a href="#summary">summary</a><a href="#config">config</a>
+    </nav>
+    <div class="live"><span class="pulse"></span> live · 4 workers</div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- HERO -->
+  <div class="hero">
+    <canvas id="wave" width="1440" height="460"></canvas>
+    <p class="kicker">caching tts proxy · voice traffic control</p>
+    <h1>Speak once.<br><span class="alt">Serve forever.</span></h1>
+    <p class="lede">DragonTTS sits between <b>Clairvoyance</b> and the TTS providers — Cartesia, ElevenLabs, Gemini, Sarvam — caching every synthesized clip to a single PVC so a repeated phrase returns instantly, for free.</p>
+    <div class="chips">
+      <span class="chip c-lime"><i></i>write-through ON</span>
+      <span class="chip c-amber"><i></i>TTL 2–6 days</span>
+      <span class="chip c-cyan"><i></i>pcm_s16le · 16 kHz</span>
+      <span class="chip c-rose"><i></i>stitch retired</span>
+    </div>
+  </div>
+
+  <!-- FLOW -->
+  <section id="flow">
+    <div class="shead"><span class="snum">01 /</span><h2>Signal flow</h2></div>
+    <p class="ssub">Clairvoyance sends one <code style="font-family:var(--mono);color:var(--cyan)">/tts/stream</code> request per sentence. DragonTTS resolves a cache key — if the clip exists and hasn't expired, it streams back instantly; otherwise it synthesizes live and stores the result.</p>
+
+    <div class="flow reveal">
+      <span class="packet"></span>
+      <div class="lanes">
+        <div class="lane">
+          <div class="node"><span class="lbl">caller</span><span class="v">Clairvoyance</span></div>
+          <div class="wire"></div>
+          <div class="node hero-n"><span class="lbl">dragon tts</span><span class="v">cache key → lookup</span></div>
+        </div>
+        <div class="fork">
+          <div class="branch">
+            <span class="tag hit">HIT</span>
+            <div class="wire" style="margin:0 10px"></div>
+            <div class="node"><span class="v">stream cached blob</span></div>
+            <div class="wire" style="margin:0 10px"></div>
+            <span style="font-family:var(--mono);font-size:11px;color:var(--lime)">~free · low TTFB</span>
+          </div>
+          <div class="branch">
+            <span class="tag miss">MISS</span>
+            <div class="wire" style="margin:0 10px"></div>
+            <div class="providers">
+              <span class="pv">Cartesia</span><span class="pv">ElevenLabs</span><span class="pv">Gemini</span><span class="pv">Sarvam</span>
+            </div>
+            <div class="wire" style="margin:0 10px"></div>
+            <span style="font-family:var(--mono);font-size:11px;color:var(--muted)">synth → store → stream</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- METRICS -->
+  <section id="metrics">
+    <div class="shead"><span class="snum">02 /</span><h2>Cache economics</h2></div>
+    <p class="ssub">A representative 24h window. Words-from-cache % is the real savings lever — it's what the daily Slack summary converts into rupees saved.</p>
+
+    <div class="metrics">
+      <div class="metric m-hit reveal">
+        <div class="mlbl">Cache hit rate</div>
+        <div class="mval" data-count="82" data-suffix="%">0%</div>
+        <div class="munit"><span data-count="24353">0</span> hits / <span data-count="29758">0</span> requests</div>
+        <div class="vu" id="vu"></div>
+      </div>
+      <div class="metric m-words reveal">
+        <div class="mlbl">Words from cache</div>
+        <div class="mval" data-count="78" data-suffix="%">0%</div>
+        <div class="munit"><span data-count="223115">0</span> / <span data-count="285402">0</span> words</div>
+        <div style="margin-top:14px;font-family:var(--mono);font-size:11px;color:var(--dim)">words synthesized avoided</div>
+      </div>
+      <div class="metric m-cost reveal">
+        <div class="mlbl">Est. cost saved · 24h</div>
+        <div class="mval"><span style="font-size:.7em">₹</span><span data-count="6336">0</span></div>
+        <div class="munit">all providers · 1 USD = ₹96</div>
+      </div>
+      <div class="metric m-entries reveal">
+        <div class="mlbl">Cache entries</div>
+        <div class="mval" data-count="11168">0</div>
+        <div class="munit">unique phrases · 1.6 GB on disk</div>
+      </div>
+      <div class="metric m-pvc reveal">
+        <div class="mlbl">PVC utilization</div>
+        <div class="mval"><span data-count="6">0</span>%</div>
+        <div class="munit">1.6 GB used · 29.4 GB provisioned</div>
+        <div class="bartrack"><div class="barfill" data-fill="6"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PROVIDERS -->
+  <section id="providers">
+    <div class="shead"><span class="snum">03 /</span><h2>Per provider</h2></div>
+    <p class="ssub">Hit rate and words-from-cache differ by provider — Gemini (Kannada) sees the most traffic and the highest reuse.</p>
+    <div class="prov-grid">
+      <div class="pcard reveal">
+        <h3><i style="background:var(--cyan)"></i> gemini</h3>
+        <div class="hitline"><i data-fill="83" style="background:var(--cyan)"></i></div>
+        <div class="row"><span>hit rate</span><b>83% · 21403 / 25660</b></div>
+        <div class="row"><span>words from cache</span><b>75%</b></div>
+        <div class="row"><span>cost saved</span><b><span class="tag-rupee">₹</span>5,280</b></div>
+      </div>
+      <div class="pcard reveal">
+        <h3><i style="background:var(--amber)"></i> elevenlabs</h3>
+        <div class="hitline"><i data-fill="72" style="background:var(--amber)"></i></div>
+        <div class="row"><span>hit rate</span><b>72% · 2950 / 4098</b></div>
+        <div class="row"><span>words from cache</span><b>55%</b></div>
+        <div class="row"><span>cost saved</span><b><span class="tag-rupee">₹</span>1,056</b></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- POLICY -->
+  <section id="policy">
+    <div class="shead"><span class="snum">04 /</span><h2>Cache policy</h2></div>
+    <div class="policy">
+      <div class="ttl reveal">
+        <div style="font-family:var(--mono);font-size:12px;color:var(--muted)">LENGTH-SCALED TTL</div>
+        <div style="font-family:var(--display);font-weight:700;font-size:22px;margin-top:4px;letter-spacing:-.02em">ttl = clamp(48h + 6h·words, 48h, 6d)</div>
+        <div class="scale">
+          <div class="track"></div><div class="cap"></div>
+          <span class="lo">48 h floor</span><span class="hi">6 d cap</span>
+          <span class="words" style="left:8%">1w</span><span class="words" style="left:30%">5w</span><span class="words" style="left:55%">10w</span><span class="words" style="left:78%">≥16w → cap</span>
+        </div>
+        <p style="color:var(--muted);font-size:13px;margin:10px 0 0">Longer phrases live longer — the scripted lines worth caching. A purge sweep reaps expired rows + blobs every 20 min.</p>
+      </div>
+      <div class="feats reveal">
+        <div class="feat on"><span class="dot"></span><div><h4>write-through</h4><p>every MISS is stored on the request path — recurring phrases cache themselves.</p></div></div>
+        <div class="feat on"><span class="dot"></span><div><h4>single-flight + INSERT OR IGNORE</h4><p>one key = one row, one file — never duplicates, even under concurrency.</p></div></div>
+        <div class="feat off"><span class="dot"></span><div><h4>predictive warm · stitch · pass-through</h4><p>retired (off). write-through is the whole cache now.</p></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SLACK SUMMARY -->
+  <section id="summary">
+    <div class="shead"><span class="snum">05 /</span><h2>Daily Slack summary</h2></div>
+    <div class="card-stage">
+      <div class="card-copy reveal">
+        <h3>One post a day, 10 PM IST.</h3>
+        <p>A background task rolls up the last 24h and posts a cache-economics digest to the Breeze Sentinels channel. A once-per-day SQLite claim keeps the four workers from double-posting.</p>
+        <ul>
+          <li>posts at 16:30 UTC (10 PM IST)</li>
+          <li>per-provider hit %, words-from-cache %, ₹ saved</li>
+          <li>cost = Σ (words_from_cache × rate) → ₹ at 96, rounded</li>
+          <li>never raises — a Slack outage just skips</li>
+          <li>POST /slack-summary to force-send</li>
+        </ul>
+      </div>
+      <div class="slack reveal">
+        <div class="sh">📊 DragonTTS Daily Cache Summary — 16-07-26</div>
+        <div class="grid">
+          <div><b>Cache hit rate</b>82% (24,353 / 29,758 requests)</div>
+          <div><b>Words from cache</b>78% (223,115 / 285,402 words)</div>
+          <div><b>Est. cost saved</b><span class="tag-rupee">₹6,336</span> (all providers)</div>
+          <div><b>Window</b>2026-07-15 → 2026-07-16 (UTC)</div>
+        </div>
+        <div class="psec">
+          <h5>gemini</h5>
+          <p>• hit rate: <b>83%</b> (21,403 / 25,660)</p>
+          <p>• words from cache: <b>75%</b></p>
+          <p>• cost saved: <b><span class="tag-rupee">₹5,280</span></b></p>
+        </div>
+        <div class="psec">
+          <h5>elevenlabs</h5>
+          <p>• hit rate: <b>72%</b> (2,950 / 4,098)</p>
+          <p>• words from cache: <b>55%</b></p>
+          <p>• cost saved: <b><span class="tag-rupee">₹1,056</span></b></p>
+        </div>
+        <div class="cc">cc: <b>@breeze-sentinals</b></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CONFIG -->
+  <section id="config">
+    <div class="shead"><span class="snum">06 /</span><h2>Configuration</h2></div>
+    <div class="cfg reveal">
+      <div class="row h"><div>env</div><div>prod</div><div>purpose</div></div>
+      <div class="row"><div class="k">ENABLE_WRITE_THROUGH</div><div class="v">true</div><div class="d">store MISS results on the request path</div></div>
+      <div class="row"><div class="k">CACHE_TTL_MAX_SECONDS</div><div class="v">518400 (6d)</div><div class="d">ttl cap · base 48h, +6h/word</div></div>
+      <div class="row"><div class="k">TTL_PURGE_INTERVAL_SECONDS</div><div class="v">1200 (20m)</div><div class="d">expired-row + blob reap cadence</div></div>
+      <div class="row"><div class="k">METRICS_LATENCY_SAMPLE_RATE</div><div class="v">0.3</div><div class="d">fraction of requests timed (ttfb/total/synth)</div></div>
+      <div class="row"><div class="k">PREDICTIVE_STITCH_ENABLED</div><div class="v warn">false</div><div class="d">retired — write-through only</div></div>
+      <div class="row"><div class="k">SLACK_SUMMARY_TIME_UTC</div><div class="v">16:30</div><div class="d">daily post · 10 PM IST</div></div>
+      <div class="row"><div class="k">SLACK_USD_TO_INR</div><div class="v">96</div><div class="d">cost display in ₹, rounded</div></div>
+      <div class="row"><div class="k">SLACK_WEBHOOK_URL</div><div class="v warn">secret</div><div class="d">empty = Slack feature off (kubectl-injected)</div></div>
+      <div class="row"><div class="k">PROVIDER_RESILIENCE</div><div class="v">{…8…}</div><div class="d">per-provider concurrency bulkhead</div></div>
+    </div>
+  </section>
+
+  <footer>
+    <span>DragonTTS · caching tts proxy · SQLite + filesystem on a GKE RWO PVC</span>
+    <span>full API reference → <a href="endpoints.md">endpoints.md</a></span>
+  </footer>
+</div>
+
+<script>
+  // ---- waveform ----
+  (function(){
+    const c=document.getElementById('wave'); if(!c) return;
+    const ctx=c.getContext('2d'); let t=0;
+    const W=c.width,H=c.height;
+    function draw(){
+      ctx.clearRect(0,0,W,H);
+      const bars=96, bw=W/bars;
+      for(let i=0;i<bars;i++){
+        const p=i/bars;
+        const env=Math.sin(p*Math.PI);                              // fade at edges
+        const f=0.6+0.4*Math.sin(i*0.35+t*0.9)+0.3*Math.sin(i*0.13-t*0.5);
+        const h=Math.max(2, f*env*H*0.5);
+        const x=i*bw+bw*0.5;
+        const grd=ctx.createLinearGradient(0,H/2-h,0,H/2+h);
+        grd.addColorStop(0,'rgba(94,211,243,0.0)');
+        grd.addColorStop(.5,'rgba(200,249,78,0.55)');
+        grd.addColorStop(1,'rgba(94,211,243,0.0)');
+        ctx.fillStyle=grd;
+        ctx.fillRect(x-1, H/2-h, 2, h*2);
+      }
+      t+=0.06; requestAnimationFrame(draw);
+    }
+    draw();
+  })();
+
+  // ---- VU meter build ----
+  (function(){
+    const vu=document.getElementById('vu'); if(!vu) return;
+    for(let i=0;i<24;i++){const b=document.createElement('i'); vu.appendChild(b);}
+  })();
+
+  // ---- reveal + count/fill on view ----
+  function animate(el){
+    if(el.dataset.done) return; el.dataset.done='1';
+    el.querySelectorAll('[data-count]').forEach(n=>{
+      const target=+n.dataset.count, suffix=n.dataset.suffix||'';
+      const dur=1300, start=performance.now();
+      function step(now){
+        const p=Math.min(1,(now-start)/dur), e=1-Math.pow(1-p,3);
+        n.textContent=Math.round(target*e).toLocaleString()+suffix;
+        if(p<1) requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+    });
+    el.querySelectorAll('[data-fill]').forEach(n=>{
+      requestAnimationFrame(()=>n.style.width=n.dataset.fill+'%');
+    });
+    // VU
+    const vu=el.querySelector('#vu');
+    if(vu){ const pct=82; [...vu.children].forEach((b,i)=>{
+      setTimeout(()=>{ if(i/vu.children.length*100 < pct) b.classList.add('on'); }, 18*i);
+    });}
+  }
+  const io=new IntersectionObserver((es)=>{
+    es.forEach(e=>{ if(e.isIntersecting){ e.target.classList.add('in'); animate(e.target); io.unobserve(e.target);} });
+  },{threshold:.18});
+  document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+  // animate hero-adjacent metrics already in view on load
+  document.querySelectorAll('#metrics .reveal').forEach(el=>{ const r=el.getBoundingClientRect(); if(r.top<innerHeight) animate(el); });
+</script>
+</body>
+</html>
