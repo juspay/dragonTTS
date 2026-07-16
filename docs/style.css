@@ -1,0 +1,85 @@
+/* DragonTTS docs — clean, centered, no TOC overlap, scrollable wide content */
+
+:root {
+  --dt-max: 1200px;
+  --dt-body: 800px;
+  --dt-accent: #0d6efd;
+}
+
+/* cap + center the whole page (kills the huge empty side gutters) */
+#quarto-content,
+.quarto-container {
+  max-width: var(--dt-max);
+  margin-inline: auto;
+}
+
+/* readable body column; balanced left/right */
+main.content,
+div#quarto-content main {
+  max-width: var(--dt-body);
+}
+
+/* TOC: sticky, never overlaps the body, scrolls independently */
+nav[role="doc-toc"],
+#TOC,
+aside.sidebar,
+.toc-actions {
+  position: sticky;
+  top: 1.25rem;
+  align-self: start;
+  max-height: calc(100vh - 2.5rem);
+  overflow-y: auto;
+}
+
+/* wide tables / code / diagrams scroll IN PLACE instead of spilling under the TOC */
+main.content table,
+main.content pre,
+.cell,
+.cell-output,
+figure,
+.quarto-figure,
+.mermaid {
+  max-width: 100%;
+  overflow-x: auto;
+}
+main.content table {
+  display: block;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+/* typography */
+h1, h2, h3, h4 {
+  font-weight: 660;
+  letter-spacing: -0.012em;
+  scroll-margin-top: 2rem;
+}
+h1.title {
+  border-bottom: 3px solid var(--dt-accent);
+  padding-bottom: 0.4rem;
+}
+h2 {
+  margin-top: 2rem;
+  padding-bottom: 0.2rem;
+  border-bottom: 1px solid var(--bs-border-color, #e5e7eb);
+}
+
+/* code blocks */
+pre {
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+}
+code {
+  font-size: 0.9em;
+}
+
+/* callouts a touch tighter */
+.callout {
+  border-radius: 10px;
+}
+
+/* mermaid diagrams: center + no awkward clipping */
+.mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
