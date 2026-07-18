@@ -167,6 +167,35 @@ async def test_stream_latency_recorded(svc, monkeypatch):
         assert lat[kind]["p95_us"] >= lat[kind]["avg_us"]
 
 
+# --- per-day latency --------------------------------------------------------
+
+
+async def test_latency_summary_daily(tmp_storage):
+    meta = SQLiteMetadataStore(settings.db_path)
+    await meta.init()
+
+    def seed(conn):
+        conn.executemany(
+            "INSERT INTO latency_samples (date, kind, latency_us) VALUES (?, ?, ?)",
+            [
+                ("2026-07-16", "synth", 100), ("2026-07-16", "synth", 200),
+                ("2026-07-16", "synth", 300), ("2026-07-16", "total", 500),
+                ("2026-07-17", "synth", 110), ("2026-07-17", "synth", 220),
+            ],
+        )
+
+    await meta._run(seed)
+    out = await meta.latency_summary_daily(from_date="2026-07-16", to_date="2026-07-17")
+    assert set(out) == {"2026-07-16", "2026-07-17"}
+    s = out["2026-07-16"]["synth"]
+    assert s["count"] == 3 and s["avg_us"] == 200.0
+    # p95 of [100,200,300] cnt=3 -> offset 2 -> 300 (matches latency_summary math)
+    assert s["p95_us"] == 300
+    assert out["2026-07-16"]["total"]["count"] == 1
+    # kinds with no samples that day are present with count 0
+    assert out["2026-07-16"]["ttfb"] == {"avg_us": None, "p95_us": None, "count": 0}
+
+
 # --- migration on a pre-analytics DB ----------------------------------
 
 

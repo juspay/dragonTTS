@@ -150,7 +150,7 @@ spec:
             - name: SLACK_SUMMARY_TIME_UTC
               value: "16:30"
             - name: SLACK_COST_PER_WORD
-              value: '{"cartesia":0.000002,"elevenlabs":0.00031,"gemini":0.000293,"sarvam":0.000005}'
+              value: '{"cartesia":0.000002,"elevenlabs":0.00032,"gemini":0.00016,"sarvam":0.000005}'
             # USD -> INR for the cost-saved display (rupees, rounded, no paisa).
             - name: SLACK_USD_TO_INR
               value: "96"

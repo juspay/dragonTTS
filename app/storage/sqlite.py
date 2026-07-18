@@ -1043,6 +1043,58 @@ class SQLiteMetadataStore:
 
         return await self._run(_q)
 
+    async def latency_summary_daily(
+        self, from_date: str | None = None, to_date: str | None = None
+    ) -> dict:
+        """Per-day, per-kind latency ``{date: {kind: {avg_us, p95_us, count}}}``.
+        p95 via ORDER BY + OFFSET (matches :meth:`latency_summary`); one ``_run``
+        walks the distinct sampled dates in range. Powers the per-day ``latency``
+        block on /stats/daily."""
+        kinds = ("ttfb", "synth", "cache_serve", "total")
+        clauses: list[str] = []
+        args: list = []
+        if from_date:
+            clauses.append("date >= ?")
+            args.append(from_date)
+        if to_date:
+            clauses.append("date <= ?")
+            args.append(to_date)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        def _q(conn: sqlite3.Connection) -> dict:
+            out: dict[str, dict] = {}
+            dates = [
+                r[0] for r in conn.execute(
+                    f"SELECT DISTINCT date FROM latency_samples{where} ORDER BY date", args
+                )
+            ]
+            for d in dates:
+                present = {
+                    kind: (cnt, avg)
+                    for kind, cnt, avg in conn.execute(
+                        "SELECT kind, COUNT(*), COALESCE(AVG(latency_us), 0) "
+                        "FROM latency_samples WHERE date = ? GROUP BY kind",
+                        (d,),
+                    )
+                }
+                d_out: dict[str, dict] = {}
+                for kind in kinds:
+                    if kind not in present:
+                        d_out[kind] = {"avg_us": None, "p95_us": None, "count": 0}
+                        continue
+                    cnt, avg = present[kind]
+                    offset = max(0, min(cnt - 1, int(cnt * 0.95)))
+                    p95 = conn.execute(
+                        "SELECT latency_us FROM latency_samples "
+                        "WHERE date = ? AND kind = ? ORDER BY latency_us LIMIT 1 OFFSET ?",
+                        (d, kind, offset),
+                    ).fetchone()[0]
+                    d_out[kind] = {"avg_us": round(avg, 1), "p95_us": int(p95), "count": cnt}
+                out[d] = d_out
+            return out
+
+        return await self._run(_q)
+
     async def prune_latency(self, retention_days: int) -> None:
         """Delete latency_samples older than ``retention_days`` (called by the
         periodic checkpoint loop to bound table growth)."""

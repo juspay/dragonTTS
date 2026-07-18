@@ -1370,6 +1370,7 @@ class CacheService:
         per-provider breakdown. ``provider`` narrows the view to one provider —
         the day's totals then reflect that provider only."""
         raw = await self._metadata.daily_summary(from_date, to_date)
+        lat_by_day = await self._metadata.latency_summary_daily(from_date, to_date)
         days = []
         for date in sorted(raw):
             byp_all = raw[date]["by_provider"]
@@ -1383,6 +1384,7 @@ class CacheService:
                 "date": date,
                 "totals": self._derive(base),
                 "by_provider": {p: self._derive(m) for p, m in byp.items()},
+                "latency": lat_by_day.get(date, {}),
             })
         return {"range": {"from": from_date, "to": to_date}, "days": days}
 
