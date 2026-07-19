@@ -222,7 +222,7 @@ class Settings(BaseSettings):
     # path (a 1-2 word prefix isn't worth streaming early).
     pass_through_stitch_min_words: int = 2
     # --- Stitch seam-DSP knobs (numpy) — tune assembled-clip quality via env. ---
-    predictive_stitch_xfade_ms: float = 30.0        # crossfade overlap at each splice (15-30ms typical; shorter clicks, longer smears)
+    predictive_stitch_xfade_ms: float = 8.0         # crossfade overlap at each splice. Stitch joins UNRELATED fragments, so a long window (the old 30ms) audibly doubles/smears the seam and can clip on correlated edges; ~8ms + the zero-crossing anchor is clean. Env-tunable.
     predictive_stitch_target_rms_db: float = -20.0  # per-fragment loudness target (speech ~-23..-18 dBFS)
     predictive_stitch_rms_floor_db: float = -55.0   # below this a fragment isn't amplified (don't hiss up a breath/gap)
     predictive_stitch_sil_relative_db: float = 25.0 # silence gate: a window this many dB below the clip peak is trimmed (HIGHER = more aggressive gap cutting)

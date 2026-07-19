@@ -81,7 +81,8 @@ CREATE TABLE IF NOT EXISTS metrics_daily_provider (
 CREATE TABLE IF NOT EXISTS latency_samples (
     date        TEXT NOT NULL,
     kind        TEXT NOT NULL,
-    latency_us  INTEGER NOT NULL
+    latency_us  INTEGER NOT NULL,
+    provider    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_latency_kind_date ON latency_samples(kind, date);
 
@@ -163,17 +164,40 @@ _METRICS_MIGRATIONS = [
     # here (every synth-path record_metrics passes provider=), it just wasn't
     # persisted before this column existed.
     ("metrics_daily_provider", "words_synthesized INTEGER NOT NULL DEFAULT 0"),
+    # Per-provider latency. Nullable so pre-existing rows stay NULL (the
+    # by-provider query filters provider IS NOT NULL). Idempotent ADD COLUMN.
+    ("latency_samples", "provider TEXT"),
 ]
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
     """Add new columns to existing tables (no-op on a fresh DB, which already has
-    them via _SCHEMA). SQLite ADD COLUMN ... DEFAULT 0 is online/non-locking."""
+    them via _SCHEMA). SQLite ADD COLUMN ... DEFAULT 0 is online/non-locking.
+    Each check+ALTER is wrapped in BEGIN IMMEDIATE so the table_info guard and
+    the ADD COLUMN are atomic across worker processes (see comment below)."""
     for table, ddl in _METRICS_MIGRATIONS:
         col = ddl.split()[0]
-        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-        if col not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        # BEGIN IMMEDIATE makes the table_info check + ADD COLUMN atomic ACROSS
+        # worker processes: without it, two uvicorn workers starting against the
+        # same PVC DB can both read "column absent" then both ALTER, the second
+        # failing with 'duplicate column name' and crash-looping that worker.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if col not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    # Indexes that depend on a migrated column are created here (after the ALTER),
+    # NOT in _SCHEMA — _SCHEMA runs before _migrate and would reference a
+    # not-yet-existing column on an old DB (the provider index failed that way).
+    # Idempotent via IF NOT EXISTS; a no-op once it exists.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_latency_provider_kind_date "
+        "ON latency_samples(provider, kind, date)"
+    )
 
 
 T = TypeVar("T")
@@ -206,9 +230,9 @@ class SQLiteMetadataStore:
         # Per-connection page cache. With one connection per worker thread,
         # keep this modest (8MB) so N connections stay memory-bounded; the
         # 256MB mmap below carries the real read working set (OS page cache).
-        conn.execute("PRAGMA cache_size = -8192")  # ~8MB page cache
+        conn.execute("PRAGMA cache_size = -2048")  # ~2MB page cache (was 8MB) -- the mmap + OS page cache carry the real read working set, so keep this small; bounds per-connection RSS x (THREAD_POOL_WORKERS conns) x (--workers processes) under the pod's memory limit
         conn.execute("PRAGMA temp_store = MEMORY")
-        conn.execute("PRAGMA mmap_size = 268435456")  # 256MB mmap for reads
+        conn.execute("PRAGMA mmap_size = 67108864")  # 64MB mmap for reads (was 256MB) -- bounds resident mmap pages under the cgroup limit; hot reads still come from the OS page cache
         return conn
 
     async def init(self) -> None:
@@ -857,22 +881,26 @@ class SQLiteMetadataStore:
         await self._run(_t)
 
     async def record_latency_batch(self, samples: list[tuple]) -> None:
-        """Persist a batch of ``(kind, latency_us)`` latency samples (today)."""
+        """Persist a batch of ``(kind, latency_us, provider)`` latency samples (today).
+
+        ``provider`` is nullable for back-compat (older call sites may pass None)."""
         if not samples:
             return
         today = datetime.now(timezone.utc).date().isoformat()
-        rows = [(today, kind, int(us)) for kind, us in samples]
+        rows = [(today, kind, int(us), prov) for kind, us, prov in samples]
 
         def _w(conn: sqlite3.Connection) -> None:
             conn.executemany(
-                "INSERT INTO latency_samples (date, kind, latency_us) VALUES (?, ?, ?)", rows
+                "INSERT INTO latency_samples (date, kind, latency_us, provider) "
+                "VALUES (?, ?, ?, ?)",
+                rows,
             )
 
         await self._run(_w)
 
-    async def record_latency(self, kind: str, latency_us: int) -> None:
+    async def record_latency(self, kind: str, latency_us: int, provider: str | None = None) -> None:
         """Single-sample convenience (used when write-behind is disabled)."""
-        await self.record_latency_batch([(kind, latency_us)])
+        await self.record_latency_batch([(kind, latency_us, provider)])
 
     async def metrics_summary(self, from_date: str | None = None, to_date: str | None = None) -> dict:
         clauses: list[str] = []
@@ -1091,6 +1119,68 @@ class SQLiteMetadataStore:
                     ).fetchone()[0]
                     d_out[kind] = {"avg_us": round(avg, 1), "p95_us": int(p95), "count": cnt}
                 out[d] = d_out
+            return out
+
+        return await self._run(_q)
+
+    async def latency_summary_by_provider(
+        self,
+        from_date: str | None = None,
+        to_date: str | None = None,
+        provider: str | None = None,
+    ) -> dict:
+        """Per-provider x per-day x per-kind latency
+        ``{provider: {date: {kind: {avg_us, p95_us, count}}}}``.
+
+        p95 via ORDER BY + OFFSET (matches :meth:`latency_summary_daily`); uses
+        idx_latency_provider_kind_date. Pre-migration rows have NULL provider and
+        are excluded (``provider IS NOT NULL`` when no filter is given)."""
+        kinds = ("ttfb", "synth", "cache_serve", "total")
+        clauses: list[str] = ["provider IS NOT NULL"]
+        args: list = []
+        if provider is not None:
+            clauses.append("provider = ?")
+            args.append(provider)
+        if from_date:
+            clauses.append("date >= ?")
+            args.append(from_date)
+        if to_date:
+            clauses.append("date <= ?")
+            args.append(to_date)
+        base_where = " WHERE " + " AND ".join(clauses)
+
+        def _q(conn: sqlite3.Connection) -> dict:
+            out: dict[str, dict] = {}
+            rows = conn.execute(
+                f"SELECT DISTINCT provider, date FROM latency_samples{base_where} "
+                f"ORDER BY provider, date",
+                args,
+            ).fetchall()
+            for prov, d in rows:
+                p_out = out.setdefault(prov, {})
+                present = {
+                    kind: (cnt, avg)
+                    for kind, cnt, avg in conn.execute(
+                        "SELECT kind, COUNT(*), COALESCE(AVG(latency_us), 0) "
+                        "FROM latency_samples WHERE provider = ? AND date = ? GROUP BY kind",
+                        (prov, d),
+                    )
+                }
+                d_out: dict[str, dict] = {}
+                for kind in kinds:
+                    if kind not in present:
+                        d_out[kind] = {"avg_us": None, "p95_us": None, "count": 0}
+                        continue
+                    cnt, avg = present[kind]
+                    offset = max(0, min(cnt - 1, int(cnt * 0.95)))
+                    p95 = conn.execute(
+                        "SELECT latency_us FROM latency_samples "
+                        "WHERE provider = ? AND date = ? AND kind = ? "
+                        "ORDER BY latency_us LIMIT 1 OFFSET ?",
+                        (prov, d, kind, offset),
+                    ).fetchone()[0]
+                    d_out[kind] = {"avg_us": round(avg, 1), "p95_us": int(p95), "count": cnt}
+                p_out[d] = d_out
             return out
 
         return await self._run(_q)

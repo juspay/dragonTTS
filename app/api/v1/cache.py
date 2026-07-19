@@ -120,6 +120,52 @@ async def stats_daily(
     return await cache.daily_stats(from_date=from_date, to_date=to_date, provider=provider)
 
 
+@router.get("/stats/latency")
+async def stats_latency(
+    request: Request,
+    from_date: str | None = Query(default=None, alias="from"),
+    to_date: str | None = Query(default=None, alias="to"),
+    provider: str | None = None,
+):
+    """Per-provider x per-day latency (avg/p95/count, microseconds):
+    ``synth`` (provider synth time, MISS-only), ``total`` (end-to-end),
+    ``cache_serve`` (HIT serve), ``ttfb`` (stream first byte), plus a derived
+    ``miss_overhead_us`` = total.avg - synth.avg (DragonTTS work beyond the
+    provider call). ?from=&to= YYYY-MM-DD (UTC); ?provider= narrows to one."""
+    for label, value in (("from", from_date), ("to", to_date)):
+        if value is not None:
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"invalid {label}; use YYYY-MM-DD")
+    metadata = request.app.state.metadata
+    providers = await metadata.latency_summary_by_provider(
+        from_date=from_date, to_date=to_date, provider=provider
+    )
+    # Derive the MISS overhead per day: total.avg - synth.avg. Population estimate
+    # only -- synth and total are sampled independently per kind, so the same
+    # request isn't guaranteed to appear in both populations.
+    for _prov, days in providers.items():
+        for _date, kinds in days.items():
+            total_avg = kinds.get("total", {}).get("avg_us")
+            synth_avg = kinds.get("synth", {}).get("avg_us")
+            kinds["miss_overhead_us"] = (
+                round(total_avg - synth_avg, 1)
+                if total_avg is not None and synth_avg is not None
+                else None
+            )
+    return {
+        "range": {"from": from_date, "to": to_date, "provider": provider},
+        "providers": providers,
+        "note": (
+            "miss_overhead_us = total.avg - synth.avg (population estimate; synth "
+            "and total are independently sampled). synth = provider synth time "
+            "(MISS-only); total = end-to-end; cache_serve = HIT serve; "
+            "ttfb = stream time-to-first-byte."
+        ),
+    }
+
+
 @router.post("/cache/clear")
 async def clear_cache(
     request: Request,

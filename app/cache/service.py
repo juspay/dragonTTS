@@ -296,13 +296,16 @@ class CacheService:
             and datetime.fromisoformat(record.ttl_expires_at) <= datetime.now(timezone.utc)
         )
 
-    async def _timed(self, kind: str, t0: float) -> None:
-        """Record a latency sample (sampling-gated) for the avg/p95 rollup."""
+    async def _timed(self, kind: str, t0: float, provider: str) -> None:
+        """Record a latency sample (sampling-gated) for the avg/p95 rollup, tagged
+        with the routed provider for the per-provider latency view."""
         rate = settings.metrics_latency_sample_rate
         if rate > 0 and random.random() < rate:
-            await self._metrics.record_latency(kind, int((time.perf_counter() - t0) * 1_000_000))
+            await self._metrics.record_latency(
+                kind, int((time.perf_counter() - t0) * 1_000_000), provider
+            )
 
-    async def _timed_chunks(self, gen, t0: float):
+    async def _timed_chunks(self, gen, t0: float, provider: str):
         """Wrap a streamed chunk generator so latency rides the stream lifecycle:
         ``ttfb`` at the first yielded byte, ``total`` after the last. stream()
         returns the generator BEFORE the request finishes (the caller iterates
@@ -314,11 +317,11 @@ class CacheService:
         try:
             async for chunk in gen:
                 if first:
-                    await self._timed("ttfb", t0)
+                    await self._timed("ttfb", t0, provider)
                     first = False
                 yield chunk
         finally:
-            await self._timed("total", t0)
+            await self._timed("total", t0, provider)
 
     async def _synthesize(self, req: TTSRequest, provider: str, model: str) -> AudioResult:
         """Synthesize via the routed provider; return its NATIVE-format audio.
@@ -339,7 +342,7 @@ class CacheService:
                 language=req.language,
                 params=req.params,
             )
-        await self._timed("synth", t0)
+        await self._timed("synth", t0, provider)
         return result
 
     @staticmethod
@@ -611,6 +614,17 @@ class CacheService:
                         f"pass-through stitch span ({lo}:{hi} cached={c}) failed: "
                         f"{e}; truncating stream at prefix"
                     )
+                    # Flush the held tail from the last good span so the caller
+                    # keeps the audio it already earned (no abrupt last-bit
+                    # cutoff). Done here, NOT in finally: yielding under
+                    # GeneratorExit (client disconnect mid-stream) would raise,
+                    # and a disconnecting caller won't consume the extra chunk
+                    # anyway. `accumulated` grows too, but `completed` stays
+                    # False so nothing is stored (partial-clip invariant holds).
+                    if out is not None and len(out):
+                        async for chunk in emit(out):
+                            yield chunk
+                        out = None
                     break
                 if not c:  # a gap span that synthesized successfully
                     synth_done += 1
@@ -782,8 +796,8 @@ class CacheService:
             )
             self._hits += 1
             logger.info(f"CACHE HIT  key={key[:12]}… provider={provider}")
-            await self._timed("cache_serve", t_cs)
-            await self._timed("total", t0)
+            await self._timed("cache_serve", t_cs, provider)
+            await self._timed("total", t0, provider)
             return audio, {"X-Cache": "HIT", "X-Cache-Key": key}
 
         logger.info(f"CACHE MISS key={key[:12]}… provider={provider} — synthesizing")
@@ -820,7 +834,7 @@ class CacheService:
             self._hits += 1
             status = "HIT"
             logger.info(f"CACHE HIT (coalesced) key={key[:12]}… provider={provider}")
-        await self._timed("total", t0)
+        await self._timed("total", t0, provider)
         return audio, {"X-Cache": status, "X-Cache-Key": key}
 
     # -- streaming read path ------------------------------------------------
@@ -864,8 +878,8 @@ class CacheService:
             )
             self._hits += 1
             logger.info(f"CACHE HIT  (stream) key={key[:12]}… provider={provider}")
-            await self._timed("cache_serve", t_cs)
-            return {"X-Cache": "HIT", "X-Cache-Key": key}, self._timed_chunks(chunks, t0)
+            await self._timed("cache_serve", t_cs, provider)
+            return {"X-Cache": "HIT", "X-Cache-Key": key}, self._timed_chunks(chunks, t0, provider)
 
         logger.info(
             f"CACHE MISS (stream) key={key[:12]}… provider={provider} — streaming synth"
@@ -907,6 +921,7 @@ class CacheService:
                                     spans, span_record, words, n,
                                 ),
                                 t0,
+                                provider,
                             ),
                         )
                     # prefix too short / no cached prefix before the first gap ->
@@ -939,7 +954,7 @@ class CacheService:
                     f"CACHE MISS-STITCH (stream) key={key[:12]}… "
                     f"provider={provider} size={len(audio)}B"
                 )
-                return {"X-Cache": "MISS-STITCH", "X-Cache-Key": key}, self._timed_chunks(_chunked(audio), t0)
+                return {"X-Cache": "MISS-STITCH", "X-Cache-Key": key}, self._timed_chunks(_chunked(audio), t0, provider)
 
         instance = self._get_provider(provider)
         if instance is None:
@@ -956,7 +971,7 @@ class CacheService:
                 _h, _g = await self._stream_coalesced(
                     req, key, fut, of, provider, instance, model, params_canon, record
                 )
-                return _h, self._timed_chunks(_g, t0)
+                return _h, self._timed_chunks(_g, t0, provider)
             fut = asyncio.get_running_loop().create_future()
             self._inflight[key] = fut
             return (
@@ -967,6 +982,7 @@ class CacheService:
                         instance.native_encoding, instance.native_sample_rate, fut,
                     ),
                     t0,
+                    provider,
                 ),
             )
 
@@ -990,7 +1006,7 @@ class CacheService:
             words_served=_wc(req.transcript), words_synthesized=_wc(req.transcript),
         )
         self._misses += 1
-        return {"X-Cache": "MISS", "X-Cache-Key": key}, self._timed_chunks(_chunked(audio), t0)
+        return {"X-Cache": "MISS", "X-Cache-Key": key}, self._timed_chunks(_chunked(audio), t0, provider)
 
     async def _stream_and_store(
         self,

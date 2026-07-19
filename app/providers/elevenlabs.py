@@ -79,7 +79,10 @@ class ElevenLabsProvider(BaseTTSProvider):
         """Return the warm pool for (voice, model), creating it lazily.
 
         Returns ``None`` when pooling is disabled (pool size 0) or the key is
-        missing, so the caller falls back to one-shot synth.
+        missing, so the caller falls back to one-shot synth. NB: ``_pools`` grows
+        with distinct (voice, model) pairs and is only cleared at shutdown —
+        acceptable while the voice catalog stays fixed (re-add an LRU cap if it
+        ever diversifies).
         """
         if not self.api_key or settings.elevenlabs_stream_pool_size < 1:
             return None

@@ -53,13 +53,30 @@ class FilesystemBlobStore:
                     if parent not in self._seen_dirs:
                         parent.mkdir(parents=True, exist_ok=True)
                         self._seen_dirs.add(parent)
-            # fsync so the blob is at least as durable as the metadata row
-            # committed after it. (Hot reads are served by the OS page cache, so
-            # there's no app-level cache to keep coherent here.)
-            with open(path, "wb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
+            # Atomic publish: write a sibling temp file, fsync, then os.replace
+            # onto the final path (atomic rename-over on POSIX for same-FS paths).
+            # Two worker processes can MISS the same key at once (single-flight is
+            # per-process), so a plain open("wb") -- which truncates at open --
+            # could let a reader overlapping a writer observe a truncated/empty
+            # file. With temp+replace a reader always sees either the previous
+            # complete blob or the new complete blob, never a half-write. fsync
+            # still makes the blob at least as durable as the metadata row
+            # committed after it (cache/service._store writes blob BEFORE row).
+            tmp = parent / f".{path.name}.{os.getpid()}.{threading.get_ident():x}.tmp"
+            try:
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+            finally:
+                # After a successful os.replace the temp no longer exists (it was
+                # renamed onto `path`); this only cleans up on a pre-replace failure.
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
             return str(rel)
 
         return await asyncio.to_thread(_write)

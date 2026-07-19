@@ -97,10 +97,10 @@ class WriteBehindMetrics:
         if hot:
             self._spawn_flush()
 
-    async def record_latency(self, kind: str, latency_us: int) -> None:
+    async def record_latency(self, kind: str, latency_us: int, provider: str | None = None) -> None:
         async with self._lock:
             if len(self._latency) < 10000:  # bound memory if a flush ever stalls
-                self._latency.append((kind, int(latency_us)))
+                self._latency.append((kind, int(latency_us), provider))
             self._pending += 1
             hot = self._pending >= self._flush_batch
         if hot:

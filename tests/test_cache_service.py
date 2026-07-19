@@ -674,3 +674,185 @@ async def test_concurrent_distinct_writes_no_loss(tmp_storage):
     assert snap["total_bytes"] == 60 * 10
     assert all(r is not None for r in got)       # every key readable
 
+
+# -- atomic blob writes + stitch seam fixes (regression) --------------------
+
+import numpy as np  # noqa: E402
+
+from app.cache.service import (  # noqa: E402
+    _equal_power_xfade,
+    _prep_clip,
+    _to_int16,
+    _SR,
+    _XFADE_MS,
+)
+
+
+async def test_blob_put_is_atomic_under_concurrent_same_key_writes(tmp_path):
+    """Concurrent puts of different-sized payloads to the SAME key must never
+    expose a partial/empty file to a reader: every get returns a complete blob of
+    one of the two sizes. The old open("wb") (truncates at open) could yield a
+    short read mid-overwrite across worker processes; temp + os.replace cannot."""
+    blobs = FilesystemBlobStore(str(tmp_path / "blobs"))
+    await blobs.init()
+    key = "deadbeef" * 4
+    data_a = bytes((i * 7) & 0xFF for i in range(5000))
+    data_b = bytes((i * 11) & 0xFF for i in range(9000))
+    sp = await blobs.put(key, data_a)  # seed so the file always exists for readers
+
+    seen: list[int] = []
+
+    async def writer(data):
+        for _ in range(30):
+            await blobs.put(key, data)
+
+    async def reader():
+        for _ in range(160):
+            seen.append(len(await blobs.get(sp)))
+
+    await asyncio.gather(writer(data_a), writer(data_b), reader(), reader())
+
+    # Every observed read is a COMPLETE payload (one of the two sizes) — never a
+    # partial length — and the final file is one complete blob.
+    final = await blobs.get(sp)
+    assert len(final) in (5000, 9000)
+    partials = {n for n in seen if n not in (5000, 9000)}
+    assert not partials, f"reader saw partial blob lengths: {partials}"
+    # No temp files left behind after the writers settle.
+    assert [p for p in (tmp_path / "blobs").rglob("*.tmp")] == []
+
+
+def test_equal_power_xfade_overlaps_exactly_one_window_and_stays_bounded():
+    """Stitch 'overlap' fix. The crossfade overlaps a's tail with b's head over
+    exactly the xfade window n — removing n samples (overlap, not duplication) —
+    and the equal-power blend of sub-unity signals stays within [-1, 1] (no added
+    clip). The default window is now 8ms (was 30ms), shrinking the audible seam."""
+    sr = _SR
+    n = int(sr * _XFADE_MS / 1000)
+    a = (0.5 * np.sin(2 * np.pi * 220 * np.arange(sr) / sr)).astype(np.float32)
+    b = (0.5 * np.sin(2 * np.pi * 330 * np.arange(sr) / sr)).astype(np.float32)
+    out = _equal_power_xfade(a, b)
+    assert len(out) == len(a) + len(b) - n        # overlap removes exactly n samples
+    assert float(np.max(np.abs(out))) <= 1.0 + 1e-5
+
+
+class _ToneGapFailsProvider:
+    """Cartesia stand-in: a real tone for cached spans, raises on the gap synth, so
+    we can assert the held prefix tail is flushed on the gap-failure truncation."""
+    name = "cartesia"
+    native_encoding = "pcm_s16le"
+    native_sample_rate = 16000
+
+    def __init__(self):
+        sr = 16000
+        self._audio = _to_int16(
+            (0.4 * np.sin(2 * np.pi * 220 * np.arange(sr) / sr)).astype(np.float32)
+        )
+
+    async def synth(self, *, text, voice_id, model, language, params) -> AudioResult:
+        if text.strip() == "NAME":
+            raise RuntimeError("simulated gap failure")
+        return AudioResult(self._audio, "raw", "pcm_s16le", 16000)
+
+
+async def test_pass_through_gap_failure_flushes_held_tail(tmp_storage, monkeypatch):
+    """Stitch 'last bit cut off' fix. On a gap-synth failure the held tail of the
+    last good span is flushed, so the caller receives the FULL prepped prefix
+    (body + held tail), not just the body with the tail dropped."""
+    _enable_passthrough(monkeypatch)
+    prov = _ToneGapFailsProvider()
+    meta = SQLiteMetadataStore(settings.db_path)
+    await meta.init()
+    blobs = FilesystemBlobStore(settings.blob_dir)
+    await blobs.init()
+    svc = CacheService(meta, blobs, lambda name: prov if name == "cartesia" else None)
+    used = _spy_passthrough(svc, monkeypatch)
+
+    await svc.create(_req_text("hello there friend"))  # cached prefix
+    await svc.create(_req_text("how are you today"))   # cached suffix (gap fails before it)
+
+    headers, gen = await svc.stream(_req_text("hello there friend NAME how are you today"))
+    assert headers["X-Cache"] == "MISS-STITCH"
+    audio = b"".join([c async for c in gen])
+    assert used == [True]  # the progressive path was taken
+
+    # The held tail is flushed -> the whole prepped prefix is delivered (body +
+    # tail), byte-for-byte; before the fix the tail was dropped on the break.
+    expected = _to_int16(_prep_clip(prov._audio))
+    assert audio == expected
+    assert len(audio) == len(expected) > 0
+
+
+async def test_pass_through_clean_run_does_not_double_emit(tmp_storage, monkeypatch):
+    """Stitch 'overlap' (integration). A clean multi-span progressive run emits
+    each span's audio roughly once: total length is LESS than the sum of the raw
+    pieces (crossfades overlap, they don't duplicate) and MORE than any single
+    piece (every span contributed). A double-emit bug would make it >= the sum."""
+
+    class _Prov:
+        name = "cartesia"
+        native_encoding = "pcm_s16le"
+        native_sample_rate = 16000
+
+        def __init__(self):
+            self.by_text: dict[str, bytes] = {}
+
+        async def synth(self, *, text, voice_id, model, language, params) -> AudioResult:
+            t = text.strip()
+            sr = 16000
+            freq = 200 + (sum(ord(c) for c in t) % 400)  # distinct tone per span
+            audio = _to_int16(
+                (0.4 * np.sin(2 * np.pi * freq * np.arange(sr) / sr)).astype(np.float32)
+            )
+            self.by_text[t] = audio
+            return AudioResult(audio, "raw", "pcm_s16le", 16000)
+
+    _enable_passthrough(monkeypatch)
+    prov = _Prov()
+    meta = SQLiteMetadataStore(settings.db_path)
+    await meta.init()
+    blobs = FilesystemBlobStore(settings.blob_dir)
+    await blobs.init()
+    svc = CacheService(meta, blobs, lambda name: prov if name == "cartesia" else None)
+    used = _spy_passthrough(svc, monkeypatch)
+
+    await svc.create(_req_text("hello there friend"))
+    await svc.create(_req_text("how are you today"))
+
+    headers, gen = await svc.stream(_req_text("hello there friend NAME how are you today"))
+    assert headers["X-Cache"] == "MISS-STITCH"
+    audio = b"".join([c async for c in gen])
+    assert used == [True]  # progressive path taken
+
+    gap_text = next(
+        k for k in prov.by_text if k not in ("hello there friend", "how are you today")
+    )
+    pieces = [
+        prov.by_text["hello there friend"],
+        prov.by_text[gap_text],
+        prov.by_text["how are you today"],
+    ]
+    assert len(audio) > 0
+    assert len(audio) < sum(len(p) for p in pieces)   # overlap, not duplication
+    assert len(audio) > max(len(p) for p in pieces)   # every span contributed
+
+
+async def test_stream_miss_tees_to_cache_then_hits(svc, fake_provider):
+    """Prod write-through path (stitch OFF — the default, and the only path that
+    runs in production): a streaming MISS forwards the live provider stream to the
+    caller AND writes it through to the cache on clean completion, so the next
+    call is a HIT. Guards the atomic-write change against regressing the real prod
+    path that clairvoyance hits via /tts/stream."""
+    headers, gen = await svc.stream(_req_text("the quick brown fox"))
+    assert headers["X-Cache"] == "MISS"
+    audio = b"".join([c async for c in gen])
+    assert audio == fake_provider._audio          # live stream served in full
+    assert fake_provider.stream_calls == 1
+
+    # repeat -> served from the cache the tee wrote through (no second stream)
+    h2, gen2 = await svc.stream(_req_text("the quick brown fox"))
+    assert h2["X-Cache"] == "HIT"
+    audio2 = b"".join([c async for c in gen2])
+    assert audio2 == fake_provider._audio
+    assert fake_provider.stream_calls == 1        # HIT served from cache, no 2nd stream
+
