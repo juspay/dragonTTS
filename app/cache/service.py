@@ -788,9 +788,7 @@ class CacheService:
         if fut is not None:
             native, enc, rate, status = await fut
             return native, enc, rate, status, False  # coalesced — no own synth
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        self._inflight[key] = fut
+        fut = self._new_inflight(key)
         try:
             result = await self._produce(req, provider, model, params_canon, key, record)
             if not fut.done():
@@ -809,6 +807,30 @@ class CacheService:
         finally:
             if self._inflight.get(key) is fut:
                 self._inflight.pop(key, None)
+
+    def _new_inflight(self, key: str) -> asyncio.Future:
+        """Create + register the single-flight future for ``key``.
+
+        A done-callback retrieves any exception so a producer that aborts with no
+        coalesced waiter (e.g. a streaming client disconnects, or a provider
+        errors mid-stream) doesn't leave an *unretrieved* exception. asyncio logs
+        those at GC time ("Future exception was never retrieved"), and that log
+        routes through the loguru intercept and deadlocks. A waiter that DOES
+        ``await`` the future still raises normally — this callback only marks the
+        exception retrieved (idempotent with the waiter's own retrieval).
+        """
+        fut = asyncio.get_running_loop().create_future()
+        fut.add_done_callback(self._consume_inflight_exc)
+        self._inflight[key] = fut
+        return fut
+
+    @staticmethod
+    def _consume_inflight_exc(fut: asyncio.Future) -> None:
+        if fut.cancelled():
+            return
+        exc = fut.exception()  # retrieve -> not "Future exception was never retrieved"
+        if exc is not None:
+            logger.warning(f"in-flight synth aborted (no waiter consumed it): {exc!r}")
 
     async def get_or_synthesize(self, req: TTSRequest) -> tuple[bytes, dict]:
         # SPLIT_AT_SYMBOLS: when set and the transcript splits into >1 sentence,
@@ -1118,8 +1140,7 @@ class CacheService:
                     req, key, fut, of, provider, instance, model, params_canon, record
                 )
                 return _h, self._timed_chunks(_g, t0, provider)
-            fut = asyncio.get_running_loop().create_future()
-            self._inflight[key] = fut
+            fut = self._new_inflight(key)
             return (
                 {"X-Cache": "MISS", "X-Cache-Key": key},
                 self._timed_chunks(
@@ -1242,8 +1263,7 @@ class CacheService:
                 return await self._stream_coalesced(
                     req, key, existing, of, provider, instance, model, params_canon, record
                 )
-            fut = asyncio.get_running_loop().create_future()
-            self._inflight[key] = fut
+            fut = self._new_inflight(key)
             return (
                 {"X-Cache": "MISS", "X-Cache-Key": key},
                 self._stream_and_store(

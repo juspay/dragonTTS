@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import traceback as _tb
 
 from loguru import logger
@@ -50,18 +51,33 @@ def _gcp_json_sink(message) -> None:
 
 class InterceptHandler(logging.Handler):
     """Forward stdlib ``logging`` records into loguru so the single sink (JSON
-    in prod) formats them with a parseable severity."""
+    in prod) formats them with a parseable severity.
+
+    Re-entrancy guard: stdlib logging can fire from inside a loguru sink, a
+    ``__del__``, or a signal handler (e.g. asyncio logging an unretrieved Future
+    exception during GC). Calling back into loguru from there deadlocks its
+    internal lock ("Could not acquire internal lock ... deadlock avoided"). The
+    guard drops such nested records instead of re-entering and deadlocking.
+    """
+
+    _in_emit = threading.local()
 
     def emit(self, record: logging.LogRecord) -> None:
+        if getattr(self._in_emit, "active", False):
+            return  # nested stdlib->loguru call: drop to avoid a re-entrant deadlock
+        self._in_emit.active = True
         try:
-            level = logger.level(record.levelname).name
-        except (ValueError, TypeError):
-            level = record.levelno
-        frame, depth = logging.currentframe(), 2
-        while frame and frame.f_code.co_filename == logging.__file__:
-            frame = frame.f_back
-            depth += 1
-        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+            try:
+                level = logger.level(record.levelname).name
+            except (ValueError, TypeError):
+                level = record.levelno
+            frame, depth = logging.currentframe(), 2
+            while frame and frame.f_code.co_filename == logging.__file__:
+                frame = frame.f_back
+                depth += 1
+            logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+        finally:
+            self._in_emit.active = False
 
 
 logger.remove()
