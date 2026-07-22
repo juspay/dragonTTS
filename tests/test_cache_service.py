@@ -856,3 +856,259 @@ async def test_stream_miss_tees_to_cache_then_hits(svc, fake_provider):
     assert audio2 == fake_provider._audio
     assert fake_provider.stream_calls == 1        # HIT served from cache, no 2nd stream
 
+
+# -- SPLIT_AT_SYMBOLS (split transcript into sentences before synth/serve) ----
+
+from app.cache.service import _split_transcript  # noqa: E402
+
+
+def test_split_transcript_multi_symbol():
+    """Splits at whitespace after any of the symbols; punctuation stays on its chunk.
+    min_words=1 isolates the regex from the word-count gate."""
+    assert _split_transcript("Hi there. Hello world? Bye now!", ".?!", min_words=1) == [
+        "Hi there.", "Hello world?", "Bye now!",
+    ]
+
+
+def test_split_transcript_keeps_trailing_punct():
+    assert _split_transcript("Hi there. Hello world. Bye now", ".", min_words=1) == [
+        "Hi there.", "Hello world.", "Bye now",
+    ]
+
+
+def test_split_transcript_protects_decimals_urls_ips():
+    """A symbol NOT followed by whitespace is not a split point: decimals, URLs and
+    IPs stay whole (the whole text returns as a single chunk -> no split)."""
+    s = "The value is 3.14 visit example.com or 192.168.1.1 thanks"
+    assert _split_transcript(s, ".", min_words=1) == [s]
+
+
+def test_split_transcript_strips_and_drops_empty():
+    assert _split_transcript("  Hi there.   Hello world.  Bye now  ", ".", min_words=1) == [
+        "Hi there.", "Hello world.", "Bye now",
+    ]
+
+
+def test_split_transcript_empty_symbols_is_off():
+    assert _split_transcript("Hi there. Hello world.", "") == ["Hi there. Hello world."]
+
+
+def test_split_transcript_no_split_point_is_single_chunk():
+    assert _split_transcript("no punctuation here", ".", min_words=1) == ["no punctuation here"]
+
+
+def test_split_transcript_skips_split_when_any_part_is_one_word():
+    """A lone single-word part blocks the split: the whole phrase stays one entry.
+    ("hello" is 1 word -> "hello. how are you" is NOT split.)"""
+    assert _split_transcript("hello. how are you", ".", min_words=2) == ["hello. how are you"]
+
+
+def test_split_transcript_splits_when_all_parts_multi_word():
+    """Every part >= 2 words -> the split fires. ("hello hi. how are. you dear".)"""
+    assert _split_transcript("hello hi. how are. you dear", ".", min_words=2) == [
+        "hello hi.", "how are.", "you dear",
+    ]
+
+
+def test_split_transcript_default_min_words_is_two():
+    """Default min_words=2: a single-word sentence blocks the split."""
+    assert _split_transcript("Hi. Hello world.", ".") == ["Hi. Hello world."]  # "Hi." is 1 word
+
+
+# -- integration: split synth / serve / cache --------------------------------
+
+
+class _SplitProvider:
+    """Cartesia stand-in returning DISTINCT deterministic bytes per text, so a split
+    request's aggregate audio can be compared to the byte-concatenation of its parts.
+    Convert-on-serve is identity for the default pcm_s16le@16k format, so the served
+    audio equals the raw payload."""
+
+    name = "cartesia"
+    native_encoding = "pcm_s16le"
+    native_sample_rate = 16000
+
+    def __init__(self):
+        self.calls = 0
+        self.seen: list[str] = []
+
+    async def synth(self, *, text, voice_id, model, language, params) -> AudioResult:
+        self.calls += 1
+        self.seen.append(text)
+        return AudioResult(self.payload(text), "raw", "pcm_s16le", 16000)
+
+    @staticmethod
+    def payload(text: str) -> bytes:
+        marker = sum(ord(c) for c in text) & 0xFF
+        n = (len(text) * 13 + 16) & 0x7FF  # distinct length per text
+        return bytes([marker]) * n
+
+
+async def _split_svc(prov) -> CacheService:
+    meta = SQLiteMetadataStore(settings.db_path)
+    await meta.init()
+    blobs = FilesystemBlobStore(settings.blob_dir)
+    await blobs.init()
+    return CacheService(meta, blobs, lambda name: prov if name == "cartesia" else None)
+
+
+# Each sentence is >= 2 words so the min-words gate lets the split fire.
+_PHRASE = "Hello there. How are you. Good bye"
+_PARTS = ["Hello there.", "How are you.", "Good bye"]
+
+
+async def test_split_on_synthesizes_each_sentence_separately(tmp_storage, monkeypatch):
+    """SPLIT ON: a 3-sentence phrase (each part >=2 words) synthesizes each sentence
+    under its OWN key (3 entries, 3 synth calls), the aggregate audio is the
+    verbatim concatenation of the parts (no trim, no gap), and the full phrase
+    itself is NOT cached."""
+    monkeypatch.setattr(settings, "split_at_symbols", ".")
+    prov = _SplitProvider()
+    svc = await _split_svc(prov)
+
+    audio, h = await svc.get_or_synthesize(_req_text(_PHRASE))
+    assert h["X-Cache"] == "MISS"
+    assert prov.calls == 3                        # one synth per sentence
+    assert prov.seen == _PARTS
+    # aggregate == byte-concatenation of each part's payload, in order
+    assert audio == b"".join(_SplitProvider.payload(t) for t in prov.seen)
+
+    snap = await svc._metadata.stats()
+    assert snap["entries"] == 3                   # one entry per sentence, not 1
+    cached, *_ = await svc.check(_req_text(_PHRASE))
+    assert cached is False                        # the full phrase is NOT cached
+
+
+async def test_split_on_repeat_full_phrase_all_hit(tmp_storage, monkeypatch):
+    """A repeat of the full phrase reuses every part's entry: 0 new synths, X-Cache HIT."""
+    monkeypatch.setattr(settings, "split_at_symbols", ".")
+    prov = _SplitProvider()
+    svc = await _split_svc(prov)
+    await svc.get_or_synthesize(_req_text(_PHRASE))
+    assert prov.calls == 3
+
+    _audio, h = await svc.get_or_synthesize(_req_text(_PHRASE))
+    assert h["X-Cache"] == "HIT"
+    assert prov.calls == 3                        # no re-synth
+
+
+async def test_split_on_single_sentence_alone_hits(tmp_storage, monkeypatch):
+    """A sentence cached as a part is reused when sent ALONE — the payoff: recurring
+    sentences inside a greeting become reusable per-sentence entries."""
+    monkeypatch.setattr(settings, "split_at_symbols", ".")
+    prov = _SplitProvider()
+    svc = await _split_svc(prov)
+    await svc.get_or_synthesize(_req_text(_PHRASE))
+
+    _audio, h = await svc.get_or_synthesize(_req_text("How are you."))
+    assert h["X-Cache"] == "HIT"
+    assert prov.calls == 3                        # served from its own entry
+
+
+async def test_split_on_mixed_hit_and_miss(tmp_storage, monkeypatch):
+    """2 sentences pre-cached + 1 fresh: only the fresh one synthesizes; X-Cache MISS."""
+    monkeypatch.setattr(settings, "split_at_symbols", ".")
+    prov = _SplitProvider()
+    svc = await _split_svc(prov)
+    await svc.create(_req_text("Hello there."))
+    await svc.create(_req_text("Good bye"))
+    seed = prov.calls                             # 2, from the creates
+
+    _audio, h = await svc.get_or_synthesize(_req_text(_PHRASE))
+    assert h["X-Cache"] == "MISS"                 # "How are you." is fresh -> MISS
+    assert prov.calls == seed + 1                 # only "How are you." synthesized
+    snap = await svc._metadata.stats()
+    assert snap["entries"] == 3
+
+
+async def test_split_off_default_is_single_entry(tmp_storage, monkeypatch):
+    """OFF (default): the whole phrase is ONE cache entry — the explicit no-op
+    guarantee that nothing existing changes when the flag is unset."""
+    monkeypatch.setattr(settings, "split_at_symbols", "")  # default
+    prov = _SplitProvider()
+    svc = await _split_svc(prov)
+
+    _audio, h = await svc.get_or_synthesize(_req_text(_PHRASE))
+    assert h["X-Cache"] == "MISS"
+    assert prov.calls == 1                        # whole phrase in one synth
+    snap = await svc._metadata.stats()
+    assert snap["entries"] == 1
+    cached, *_ = await svc.check(_req_text(_PHRASE))
+    assert cached is True                         # the full phrase IS cached
+    c1, *_ = await svc.check(_req_text("How are you."))
+    assert c1 is False                            # ...and the sentences are NOT
+
+
+async def test_split_skipped_when_a_part_is_single_word(tmp_storage, monkeypatch):
+    """Min-words gate: "Hello. How are you" has a 1-word part ("Hello"), so it is NOT
+    split — one synth, one entry, whole phrase cached (no per-sentence entries)."""
+    monkeypatch.setattr(settings, "split_at_symbols", ".")
+    prov = _SplitProvider()
+    svc = await _split_svc(prov)
+
+    _audio, h = await svc.get_or_synthesize(_req_text("Hello. How are you"))
+    assert h["X-Cache"] == "MISS"
+    assert prov.calls == 1                        # not split -> single synth
+    snap = await svc._metadata.stats()
+    assert snap["entries"] == 1
+    cached, *_ = await svc.check(_req_text("Hello. How are you"))
+    assert cached is True
+
+
+async def test_split_on_stream_each_sentence_then_hit(svc, fake_provider, monkeypatch):
+    """Stream path split (SPLIT_AT_SYMBOLS_STREAM): a 3-sentence phrase streams
+    end-to-end, synthesizes each sentence via the bytes path (not live streaming),
+    and a repeat HITs."""
+    monkeypatch.setattr(settings, "split_at_symbols_stream", ".")
+    headers, gen = await svc.stream(_req_text(_PHRASE))
+    assert headers["X-Cache"] == "MISS"
+    audio = b"".join([c async for c in gen])
+    assert len(audio) > 0
+    assert fake_provider.calls == 3               # one synth per sentence
+    assert fake_provider.stream_calls == 0        # split streams via get_or_synthesize
+
+    # repeat -> every part HIT, no further synth
+    h2, gen2 = await svc.stream(_req_text(_PHRASE))
+    assert h2["X-Cache"] == "HIT"
+    _ = b"".join([c async for c in gen2])
+    assert fake_provider.calls == 3
+
+
+# -- SPLIT_AT_SYMBOLS vs SPLIT_AT_SYMBOLS_STREAM independence ----------------
+
+
+async def test_stream_does_not_split_when_only_synth_split_set(svc, fake_provider, monkeypatch):
+    """Independence: setting only SPLIT_AT_SYMBOLS (the /tts/bytes knob) must NOT
+    cause the stream path to split — stream reads SPLIT_AT_SYMBOLS_STREAM."""
+    monkeypatch.setattr(settings, "split_at_symbols", ".")
+    monkeypatch.setattr(settings, "split_at_symbols_stream", "")
+    _h, gen = await svc.stream(_req_text(_PHRASE))
+    _ = b"".join([c async for c in gen])
+    assert fake_provider.stream_calls == 1   # one live stream of the WHOLE phrase
+    assert fake_provider.calls == 0          # not split into 3 per-part synths
+
+
+async def test_stream_splits_when_only_stream_split_set(svc, fake_provider, monkeypatch):
+    """Independence: SPLIT_AT_SYMBOLS_STREAM alone splits the stream path even when
+    SPLIT_AT_SYMBOLS (the bytes knob) is off."""
+    monkeypatch.setattr(settings, "split_at_symbols", "")
+    monkeypatch.setattr(settings, "split_at_symbols_stream", ".")
+    _h, gen = await svc.stream(_req_text(_PHRASE))
+    _ = b"".join([c async for c in gen])
+    assert fake_provider.calls == 3          # 3 per-part synths (via get_or_synthesize)
+    assert fake_provider.stream_calls == 0   # not live-streamed as one phrase
+
+
+async def test_synth_does_not_split_when_only_stream_split_set(tmp_storage, monkeypatch):
+    """Independence: setting only SPLIT_AT_SYMBOLS_STREAM must NOT split the
+    /tts/bytes path — synth reads SPLIT_AT_SYMBOLS."""
+    monkeypatch.setattr(settings, "split_at_symbols", "")
+    monkeypatch.setattr(settings, "split_at_symbols_stream", ".")
+    prov = _SplitProvider()
+    svc = await _split_svc(prov)
+    _audio, h = await svc.get_or_synthesize(_req_text(_PHRASE))
+    assert h["X-Cache"] == "MISS"
+    assert prov.calls == 1                   # whole phrase in one synth (not 3 parts)
+    snap = await svc._metadata.stats()
+    assert snap["entries"] == 1              # one entry for the full phrase
+

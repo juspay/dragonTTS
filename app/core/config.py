@@ -108,6 +108,27 @@ class Settings(BaseSettings):
     # (no space) if missing, leave it if already present. Other providers read a
     # leading "." fine, so they're unaffected.
     tts_leading_dot: bool = True
+    # Split an incoming transcript into sentences BEFORE synth/serve, so each
+    # sentence is synthesized + cached under its own key (reusable by any later
+    # request that sends that sentence alone — e.g. recurring greetings). Set to
+    # the symbols to split AFTER, e.g. ".:?!" — the split fires at whitespace
+    # following one of these, so decimals ("3.14") and URLs are not broken. Empty
+    # (default) = OFF -> the whole transcript is one entry (today's behavior).
+    # The synth and stream paths are controlled INDEPENDENTLY (each can be off, or
+    # use a different symbol set):
+    split_at_symbols: str = ""          # /tts/bytes  (one-shot synth) path
+    split_at_symbols_stream: str = ""   # /tts/stream path
+    # Only split when EVERY resulting part has at least this many words. A lone
+    # single-word part (e.g. "hello" in "hello. how are you") is too small to be
+    # worth caching on its own and would needlessly fragment a phrase, so when any
+    # part is shorter the WHOLE phrase stays one entry. Default 2 = "more than 1
+    # word". Set to 1 to split even single-word sentences.
+    split_min_words_per_part: int = 2
+    # Split parts are pure-concatenated (no edge trim, no inserted gap) — nothing
+    # is cut and each part is appended exactly as synthesized. There is no gap
+    # knob: the provider's own leading/trailing silence between parts is left
+    # intact. (If you later want a normalized inter-sentence gap, re-introduce it
+    # in _get_or_synthesize_split / _stream_split.)
 
     # --- Performance ---
     thread_pool_workers: int = 32  # asyncio.to_thread pool size

@@ -12,6 +12,7 @@ node_modules/
 # Env / secrets
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 
@@ -34,3 +35,4 @@ data/
 *.wav
 *.mp3
 *.ogg
+/samples/

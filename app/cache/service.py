@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import time
 
 import numpy as np
@@ -63,6 +64,45 @@ async def _chunked(data: bytes, size: int = _STREAM_CHUNK) -> AsyncGenerator[byt
     """Yield ``data`` in fixed-size byte chunks for an HTTP streaming response."""
     for i in range(0, len(data), size):
         yield data[i : i + size]
+
+
+def _split_transcript(text: str, symbols: str, min_words: int = 2) -> list[str]:
+    """Split ``text`` into sentence chunks at whitespace following a ``symbols`` char.
+
+    Used by the SPLIT_AT_SYMBOLS feature so a multi-sentence transcript (e.g. a
+    greeting clairvoyance sends whole) is synthesized + cached one sentence per
+    key — recurring sentences then reuse their own entry. Each chunk KEEPS its
+    trailing punctuation (the per-part cache key matches a request that sends
+    that sentence alone). The split is at whitespace AFTER a symbol, which keeps
+    decimals ("3.14"), IPs ("192.168.1.1") and URLs ("example.com/path") intact
+    — the dot there isn't followed by whitespace. Empty/whitespace-only results
+    are dropped.
+
+    ``min_words`` gates the split: it only fires when EVERY part has at least that
+    many words. A lone single-word part (e.g. "hello" in "hello. how are you") is
+    too small to cache on its own and would needlessly fragment the phrase, so when
+    any part is shorter the WHOLE text is returned as one chunk.
+
+    Returns ``[text]`` (one chunk) when ``symbols`` is empty, no split point
+    exists, or the min-words gate fails — so a caller's ``len(parts) > 1`` check
+    is the on/off gate.
+
+    Note: abbreviations like "Mr. Smith" WILL split (no dictionary) — acceptable
+    for the scripted-greeting use case; set ``symbols`` to "." only to minimize it.
+    """
+    if not symbols or not text or not text.strip():
+        return [text] if (text and text.strip()) else []
+    parts = [p.strip() for p in re.split(rf"(?<=[{re.escape(symbols)}])\s+", text) if p.strip()]
+    # Min-words gate: if any part is too short, keep the whole phrase as one entry.
+    if len(parts) > 1 and any(len(p.split()) < min_words for p in parts):
+        return [text]
+    return parts
+
+
+# Split parts are pure-concatenated — no edge trim, no inserted gap — so nothing
+# is cut and each part's audio is appended exactly as the provider returned it
+# (see _get_or_synthesize_split / _stream_split). The silence-trim DSP below is
+# for stitch assembly only.
 
 
 # --- stitch assembly DSP (numpy) ------------------------------------------
@@ -771,6 +811,16 @@ class CacheService:
                 self._inflight.pop(key, None)
 
     async def get_or_synthesize(self, req: TTSRequest) -> tuple[bytes, dict]:
+        # SPLIT_AT_SYMBOLS: when set and the transcript splits into >1 sentence,
+        # synth/serve each sentence independently (each caches under its own key).
+        # Empty (default) / no split -> this is skipped and the single-phrase path
+        # below runs byte-for-byte unchanged.
+        if settings.split_at_symbols:
+            parts = _split_transcript(
+                req.transcript, settings.split_at_symbols, settings.split_min_words_per_part
+            )
+            if len(parts) > 1:
+                return await self._get_or_synthesize_split(req, parts)
         provider, model, of, params_canon, key = self._resolve(req)
         t0 = time.perf_counter()
         await self._observe(
@@ -837,6 +887,80 @@ class CacheService:
         await self._timed("total", t0, provider)
         return audio, {"X-Cache": status, "X-Cache-Key": key}
 
+    # -- SPLIT_AT_SYMBOLS (multi-sentence request -> one entry per sentence) --
+
+    async def _is_cached(self, req: TTSRequest) -> bool:
+        """True iff ``req`` resolves to a non-expired cache entry.
+
+        Used by the split stream path to set the aggregate X-Cache header up
+        front (headers must be returned before the generator streams).
+        """
+        _provider, _model, _of, _params, key = self._resolve(req)
+        record = await self._metadata.get(key)
+        return bool(record and not self._expired(record))
+
+    async def _get_or_synthesize_split(
+        self, req: TTSRequest, parts: list[str],
+    ) -> tuple[bytes, dict]:
+        """Serve a multi-sentence request as one cache entry per sentence.
+
+        Clones ``req`` per part and routes each through :meth:`get_or_synthesize`
+        (so each sentence is synthesized/served + cached under its OWN key and is
+        reused by any later request that sends that sentence alone), then
+        concatenates each part's audio VERBATIM — no edge trim, no inserted gap
+        (nothing is cut; the result is synth(part0) + synth(part1) + ...). The
+        aggregate X-Cache is HIT only when EVERY part was a HIT, else MISS (at
+        least one sentence synthesized). The full-phrase key is reported in
+        X-Cache-Key for caller reference — note the full phrase itself is NOT
+        cached, only its parts.
+
+        Each part has no whitespace-after-symbol internally (the split consumed
+        those), so the recursive :meth:`get_or_synthesize` call hits the
+        single-phrase path and does not recurse further. Only reached when
+        ``settings.split_at_symbols`` is set AND the transcript splits into >1 part.
+        """
+        # Full-phrase key for the header. _resolve normalizes req.transcript in
+        # place, but `parts` were already captured from the raw transcript by the
+        # caller, so mutating req here is harmless.
+        _p, _m, of, _pc, full_key = self._resolve(req)
+        chunks: list[bytes] = []
+        all_hit = True
+        for part in parts:
+            part_req = req.model_copy(update={"transcript": part})
+            audio, headers = await self.get_or_synthesize(part_req)
+            chunks.append(audio)
+            if headers.get("X-Cache") != "HIT":
+                all_hit = False
+        # Pure concatenation: append each part's audio verbatim — no trim, no gap
+        # (nothing is cut; the result is synth(part0) + synth(part1) + ...).
+        joined = b"".join(c for c in chunks if c)
+        return joined, {
+            "X-Cache": "HIT" if all_hit else "MISS",
+            "X-Cache-Key": full_key,
+        }
+
+    async def _stream_split(
+        self, req: TTSRequest, parts: list[str],
+    ) -> AsyncGenerator[bytes, None]:
+        """Stream a multi-sentence request one sentence at a time, back to back.
+
+        Each part is served via :meth:`get_or_synthesize` (so it caches under its
+        own key) and its converted audio chunked out VERBATIM, in order — no edge
+        trim, no inserted gap (nothing is cut; parts are appended exactly as
+        synthesized). For a MISS part this is synth-then-yield rather than live
+        provider streaming — acceptable for short sentences and only when
+        SPLIT_AT_SYMBOLS is on; the default (flag off) stream path keeps live
+        provider streaming. Each part's audio is already in the requested output
+        format (get_or_synthesize converts), so it is emitted unchanged.
+        """
+        for part in parts:
+            part_req = req.model_copy(update={"transcript": part})
+            audio, _headers = await self.get_or_synthesize(part_req)
+            if not audio:
+                continue  # empty part: skip
+            async for chunk in _chunked(audio):
+                yield chunk
+
     # -- streaming read path ------------------------------------------------
 
     async def stream(self, req: TTSRequest) -> tuple[dict, AsyncGenerator[bytes, None]]:
@@ -850,6 +974,28 @@ class CacheService:
         native fully, store native, convert, then chunk.
         """
         t0 = time.perf_counter()  # entry; total = entry -> last byte (via _timed_chunks)
+        # SPLIT_AT_SYMBOLS_STREAM: when set and the transcript splits into >1
+        # sentence, stream each sentence independently (each caches under its own
+        # key). Independent of SPLIT_AT_SYMBOLS (the /tts/bytes knob). Empty
+        # (default) / no split -> skipped; the single-phrase stream path below
+        # runs byte-for-byte unchanged. Each part is also observed inside
+        # get_or_synthesize, so warming tracks sub-phrases (not the whole phrase).
+        if settings.split_at_symbols_stream:
+            parts = _split_transcript(
+                req.transcript, settings.split_at_symbols_stream, settings.split_min_words_per_part
+            )
+            if len(parts) > 1:
+                provider, _model, _of, _pc, full_key = self._resolve(req)
+                # Headers must be set before streaming: pre-check each part's cache
+                # so the aggregate X-Cache reflects whether any sentence will synth.
+                cached = [
+                    await self._is_cached(req.model_copy(update={"transcript": p}))
+                    for p in parts
+                ]
+                return (
+                    {"X-Cache": "HIT" if all(cached) else "MISS", "X-Cache-Key": full_key},
+                    self._timed_chunks(self._stream_split(req, parts), t0, provider),
+                )
         provider, model, of, params_canon, key = self._resolve(req)
         await self._observe(
             text=req.transcript, provider=provider, voice_id=req.voice.id,
