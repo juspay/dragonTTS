@@ -69,6 +69,7 @@ class Settings(BaseSettings):
         # An empty ELEVENLABS_INDIAN_RESIDENCY_BASE_URL= line in .env would
         # otherwise blank the default; fall back to the known residency host.
         return v or ELEVENLABS_INDIAN_RESIDENCY_URL
+
     google_credentials_json: str = ""
     google_credentials_path: str = ""
 
@@ -116,8 +117,8 @@ class Settings(BaseSettings):
     # (default) = OFF -> the whole transcript is one entry (today's behavior).
     # The synth and stream paths are controlled INDEPENDENTLY (each can be off, or
     # use a different symbol set):
-    split_at_symbols: str = ""          # /tts/bytes  (one-shot synth) path
-    split_at_symbols_stream: str = ""   # /tts/stream path
+    split_at_symbols: str = ""  # /tts/bytes  (one-shot synth) path
+    split_at_symbols_stream: str = ""  # /tts/stream path
     # Only split when EVERY resulting part has at least this many words. A lone
     # single-word part (e.g. "hello" in "hello. how are you") is too small to be
     # worth caching on its own and would needlessly fragment a phrase, so when any
@@ -133,6 +134,18 @@ class Settings(BaseSettings):
     # --- Performance ---
     thread_pool_workers: int = 32  # asyncio.to_thread pool size
     bulk_create_max: int = 1000  # hard cap on /tts/create/bulk items
+    # --- Memory: return freed glibc heap to the OS (RSS-creep mitigation) ---
+    # glibc keeps freed memory in its arenas instead of releasing it to the OS,
+    # so the large short-lived audio + numpy resample buffers fragment the heap
+    # and RSS climbs to a high plateau (especially across 4 workers). malloc_trim
+    # hands that freed memory back to the OS. Safe + idempotent (a no-op when
+    # nothing is trimmable), and it has NO effect on audio quality or concurrency
+    # — it only releases already-freed heap; it changes no workers/pools/caps.
+    # gc.collect() first drops unreachable Python objects that may pin C buffers.
+    # Runs once per worker process; skipped silently on non-glibc (musl) where
+    # libc.so.6 / malloc_trim is absent. Default on, every 5 min.
+    malloc_trim_enabled: bool = True
+    malloc_trim_interval_seconds: int = 300
     # Number of warm, persistent Cartesia streaming sockets kept ready for cache
     # misses (each multiplexes many utterances by context_id). Set via env, e.g.
     # CARTESIA_STREAM_POOL_SIZE=4. 0 => open a fresh socket per miss (no pooling).
@@ -173,14 +186,18 @@ class Settings(BaseSettings):
     metrics_flush_batch_size: int = 64
     # Latency sampling: fraction of requests timed for the avg/p95 rollup (0
     # disables). perf_counter is cheap; sampling bounds latency_samples growth.
-    metrics_latency_sample_rate: float = 0.3  # fraction of requests timed for the latency rollup
+    metrics_latency_sample_rate: float = (
+        0.3  # fraction of requests timed for the latency rollup
+    )
     # latency_samples rows older than this are pruned by the periodic checkpoint
     # loop, keeping the table bounded.
     metrics_latency_retention_days: int = 14
     # --- Predictive cache warming (Part 1: frequency-based auto-warm) ---
     # Tracks recurring phrase substrings across requests and warms the frequent
     # ones into the cache so Part 2 (segment + stitch) can assemble them.
-    predictive_warm_enabled: bool = False  # off by default (stitch/warm retired; write-through only)
+    predictive_warm_enabled: bool = (
+        False  # off by default (stitch/warm retired; write-through only)
+    )
     # Length-scaled warm threshold. A short phrase (e.g. "hi") is a substring of
     # many longer ones, so its decayed count is the sum of all of them — it
     # would dominate warming and cache trivial fragments. Longer phrases are the
@@ -201,7 +218,9 @@ class Settings(BaseSettings):
     # KEPT on the token, so warmed keys match live request keys + stitch lookups.
     # Add chars (e.g. ".?!") to also split on those.
     predictive_warm_split_chars: str = "."
-    predictive_warm_decay_factor: float = 0.94  # counts x this each interval; with the 5-min interval below this is a ~1h half-life
+    predictive_warm_decay_factor: float = (
+        0.94  # counts x this each interval; with the 5-min interval below this is a ~1h half-life
+    )
     predictive_warm_decay_interval_s: int = 300  # how often decay runs (5 min)
     predictive_warm_min_floor: float = 0.5  # prune counts below this after decay
     # Slice a warmed phrase's timestamped audio into every contiguous sub-phrase
@@ -214,7 +233,9 @@ class Settings(BaseSettings):
     # --- Predictive stitching (Part 2: serve a MISS from cached sub-phrases) ---
     # On a full-text MISS, binary-search cached prefix/suffix, synth only the
     # gaps, cross-fade at seams. Skipped below the coverage gate.
-    predictive_stitch_enabled: bool = False  # off by default (retired; re-enable per-env to revive)
+    predictive_stitch_enabled: bool = (
+        False  # off by default (retired; re-enable per-env to revive)
+    )
     # Stitch a MISS from cached sub-phrases when at least this fraction is cached
     # (miss <= 1 - this). Default 0.25 = latency-favored (stitch when miss < 75%):
     # the gap synth is <=75% of the phrase so it still beats a full synth on the
@@ -243,12 +264,24 @@ class Settings(BaseSettings):
     # path (a 1-2 word prefix isn't worth streaming early).
     pass_through_stitch_min_words: int = 2
     # --- Stitch seam-DSP knobs (numpy) — tune assembled-clip quality via env. ---
-    predictive_stitch_xfade_ms: float = 8.0         # crossfade overlap at each splice. Stitch joins UNRELATED fragments, so a long window (the old 30ms) audibly doubles/smears the seam and can clip on correlated edges; ~8ms + the zero-crossing anchor is clean. Env-tunable.
-    predictive_stitch_target_rms_db: float = -20.0  # per-fragment loudness target (speech ~-23..-18 dBFS)
-    predictive_stitch_rms_floor_db: float = -55.0   # below this a fragment isn't amplified (don't hiss up a breath/gap)
-    predictive_stitch_sil_relative_db: float = 25.0 # silence gate: a window this many dB below the clip peak is trimmed (HIGHER = more aggressive gap cutting)
-    predictive_stitch_sil_guard_ms: float = 3.0     # sliver kept at each trimmed edge so onsets/offsets survive
-    predictive_stitch_zc_search_ms: float = 4.0     # window scanned for a zero crossing to anchor each splice (avoids clicks)
+    predictive_stitch_xfade_ms: float = (
+        8.0  # crossfade overlap at each splice. Stitch joins UNRELATED fragments, so a long window (the old 30ms) audibly doubles/smears the seam and can clip on correlated edges; ~8ms + the zero-crossing anchor is clean. Env-tunable.
+    )
+    predictive_stitch_target_rms_db: float = (
+        -20.0
+    )  # per-fragment loudness target (speech ~-23..-18 dBFS)
+    predictive_stitch_rms_floor_db: float = (
+        -55.0
+    )  # below this a fragment isn't amplified (don't hiss up a breath/gap)
+    predictive_stitch_sil_relative_db: float = (
+        25.0  # silence gate: a window this many dB below the clip peak is trimmed (HIGHER = more aggressive gap cutting)
+    )
+    predictive_stitch_sil_guard_ms: float = (
+        3.0  # sliver kept at each trimmed edge so onsets/offsets survive
+    )
+    predictive_stitch_zc_search_ms: float = (
+        4.0  # window scanned for a zero crossing to anchor each splice (avoids clicks)
+    )
 
     # --- Slack daily summary (mirrors clairvoyance's incoming-webhook pattern) ---
     # Off by default: an empty SLACK_WEBHOOK_URL disables the feature (no separate
@@ -256,17 +289,26 @@ class Settings(BaseSettings):
     # cache-economics summary (hit rate, words-from-cache %, est. cost saved —
     # overall + per provider) at slack_summary_time_utc. Never affects serving.
     slack_webhook_url: str = ""
-    slack_tag_users: str = "<!subteam^S05KD5LN31Q>"  # comma-separated handles/groups to cc (default: Breeze Sentinels)
-    slack_summary_time_utc: str = "16:30"    # daily post time (16:30 UTC == 10 PM IST)
-    slack_summary_tick_seconds: int = 300    # how often the background loop checks the clock
+    slack_tag_users: str = (
+        "<!subteam^S05KD5LN31Q>"  # comma-separated handles/groups to cc (default: Breeze Sentinels)
+    )
+    slack_summary_time_utc: str = "16:30"  # daily post time (16:30 UTC == 10 PM IST)
+    slack_summary_tick_seconds: int = (
+        300  # how often the background loop checks the clock
+    )
     # Per-provider $/word for the estimated-cost-saved figure (JSON env map).
     # cost_saved(provider) = words_from_cache(provider) * rate(provider); total = sum.
     # Placeholder rates — calibrate SLACK_COST_PER_WORD to your blended provider pricing.
-    slack_cost_per_word: dict = Field(default_factory=lambda: {
-        # $/word, from dashboard billing. elevenlabs: $70.36/1.36M chars (~6 c/w).
-        # gemini: $0.000293/word (confirm unit). cartesia/sarvam: placeholders.
-        "cartesia": 0.000002, "elevenlabs": 0.00031, "gemini": 0.000293, "sarvam": 0.000005,
-    })
+    slack_cost_per_word: dict = Field(
+        default_factory=lambda: {
+            # $/word, from dashboard billing. elevenlabs: $70.36/1.36M chars (~6 c/w).
+            # gemini: $0.000293/word (confirm unit). cartesia/sarvam: placeholders.
+            "cartesia": 0.000002,
+            "elevenlabs": 0.00031,
+            "gemini": 0.000293,
+            "sarvam": 0.000005,
+        }
+    )
     # USD -> INR for the cost-saved DISPLAY (the Slack summary shows rupees,
     # rounded to the nearest ₹ — no paisa). Rates above stay $/word; only the
     # shown figure is converted. Adjust if the FX rate drifts.

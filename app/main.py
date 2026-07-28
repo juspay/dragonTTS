@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import ctypes
+import gc
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -30,6 +32,7 @@ async def lifespan(app: FastAPI):
     # InterceptHandler alone misses them; override their handlers at startup.
     import logging as _logging
     from app.core.logging import InterceptHandler
+
     for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         _lg = _logging.getLogger(_name)
         _lg.handlers = [InterceptHandler()]
@@ -110,17 +113,51 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(settings.slack_summary_tick_seconds)
             try:
                 from app.alerts.summary import send_daily_summary
+
                 await send_daily_summary(cache)
             except Exception as e:
                 logger.debug(f"Slack summary tick failed: {e}")
 
     slack_summary_task = asyncio.create_task(_slack_summary_loop())
 
+    # Periodic glibc malloc_trim: return freed heap (the large short-lived audio
+    # + numpy resample buffers) to the OS so RSS doesn't plateau high. A no-op
+    # when nothing is trimmable; skipped silently on non-glibc (musl). No effect
+    # on audio quality or concurrency — it only releases already-freed heap and
+    # touches no synth/resample/worker/pool path. Runs once per worker process.
+    async def _malloc_trim_loop():
+        if not settings.malloc_trim_enabled:
+            return
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            trim = getattr(libc, "malloc_trim", None)
+        except OSError:
+            logger.warning(
+                "malloc_trim: libc.so.6 not found — trim disabled (non-glibc?)"
+            )
+            return
+        if trim is None:
+            return
+        trim.argtypes = [ctypes.c_size_t]
+        trim.restype = ctypes.c_int
+        while True:
+            try:
+                await asyncio.sleep(settings.malloc_trim_interval_seconds)
+                gc.collect()  # drop unreachable Python objects pinning C buffers
+                trim(0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"malloc_trim failed: {e}")
+
+    malloc_trim_task = asyncio.create_task(_malloc_trim_loop())
+
     logger.info(f"DragonTTS ready — providers: {registry.configured()}")
     yield
     checkpoint_task.cancel()
     ttl_purge_task.cancel()
     slack_summary_task.cancel()
+    malloc_trim_task.cancel()
     try:
         await checkpoint_task
     except (asyncio.CancelledError, Exception):
@@ -131,6 +168,10 @@ async def lifespan(app: FastAPI):
         pass
     try:
         await slack_summary_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    try:
+        await malloc_trim_task
     except (asyncio.CancelledError, Exception):
         pass
     await tracker.stop()
