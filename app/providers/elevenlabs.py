@@ -56,10 +56,14 @@ class ElevenLabsProvider(BaseTTSProvider):
                 host; the WS pool derives its wss host from this).
         """
         self.api_key = (
-            api_key if api_key is not None else settings.elevenlabs_indian_residency_api_key
+            api_key
+            if api_key is not None
+            else settings.elevenlabs_indian_residency_api_key
         )
         self.base_url = (
-            base_url if base_url is not None else settings.elevenlabs_indian_residency_base_url
+            base_url
+            if base_url is not None
+            else settings.elevenlabs_indian_residency_base_url
         )
         self._client = httpx.AsyncClient(timeout=30.0)
         # One warm pool per (voice_id, model_id): the WS binds voice (URL path)
@@ -75,7 +79,9 @@ class ElevenLabsProvider(BaseTTSProvider):
             return vs
         return {"stability": 0.5, "similarity_boost": 0.75}
 
-    def _get_pool(self, voice_id: str, model_id: str) -> elevenlabs_pool.ElevenLabsStreamPool | None:
+    def _get_pool(
+        self, voice_id: str, model_id: str
+    ) -> elevenlabs_pool.ElevenLabsStreamPool | None:
         """Return the warm pool for (voice, model), creating it lazily.
 
         Returns ``None`` when pooling is disabled (pool size 0) or the key is
@@ -96,7 +102,10 @@ class ElevenLabsProvider(BaseTTSProvider):
                 base_url=self.base_url,
                 idle_timeout=settings.elevenlabs_stream_idle_timeout,
                 min_size=settings.elevenlabs_stream_pool_size,
-                max_size=max(settings.elevenlabs_stream_pool_size * 2, settings.elevenlabs_stream_pool_size + 4),
+                max_size=max(
+                    settings.elevenlabs_stream_pool_size * 2,
+                    settings.elevenlabs_stream_pool_size + 4,
+                ),
             )
             self._pools[key] = pool
         return pool
@@ -179,6 +188,11 @@ class ElevenLabsProvider(BaseTTSProvider):
             "model_id": final_model_id,
             "voice_settings": self._voice_settings(params),
         }
+        if params.get("enable_ssml_parsing"):
+            # SSML on: ElevenLabs parses <break time=".."/> etc. into real
+            # pauses instead of reading the tags aloud. Default off; only sent
+            # when requested (all models except eleven_v3 support it).
+            payload["enable_ssml_parsing"] = True
 
         logger.info(
             f"Synthesizing with ElevenLabs (pcm_16000): {text[:50]}... "
@@ -225,6 +239,8 @@ class ElevenLabsProvider(BaseTTSProvider):
         final_language = language if language else defaults["language"]
 
         msg = {"text": text, "voice_settings": self._voice_settings(params)}
+        if params.get("enable_ssml_parsing"):
+            msg["enable_ssml_parsing"] = True  # SSML <break/> parsing (see synth)
         logger.info(
             f"Streaming via ElevenLabs multi-context WS: {text[:50]}... "
             f"[voice_id={final_voice_id}, model_id={final_model_id}]"
@@ -258,7 +274,10 @@ class ElevenLabsProvider(BaseTTSProvider):
 
         # Fallback: one-shot HTTP synth (also used when pooling is disabled).
         result = await self.synth(
-            text=text, voice_id=final_voice_id, model=final_model_id,
-            language=final_language, params=params,
+            text=text,
+            voice_id=final_voice_id,
+            model=final_model_id,
+            language=final_language,
+            params=params,
         )
         yield result.audio

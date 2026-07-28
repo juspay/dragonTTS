@@ -246,7 +246,9 @@ class ElevenLabsStreamPool:
         self._started = True
         for _ in range(self._min_size):
             await self._add_connection()
-        logger.info(f"ElevenLabs stream pool warming {self._min_size} socket(s) for voice={self._voice_id}")
+        logger.info(
+            f"ElevenLabs stream pool warming {self._min_size} socket(s) for voice={self._voice_id}"
+        )
 
     async def _add_connection(self) -> None:
         conn = _ElevenLabsConnection(self._uri, self._headers, self._connect_fn)
@@ -255,7 +257,11 @@ class ElevenLabsStreamPool:
 
     def _available(self) -> list[_ElevenLabsConnection]:
         """Ready sockets with a free context slot (under the 5-context cap)."""
-        return [c for c in self._conns if c.ready.is_set() and c.inflight < _MAX_CONTEXTS_PER_SOCKET]
+        return [
+            c
+            for c in self._conns
+            if c.ready.is_set() and c.inflight < _MAX_CONTEXTS_PER_SOCKET
+        ]
 
     async def acquire(self) -> _ElevenLabsConnection:
         """Return the least-loaded ready socket with a free context slot,
@@ -314,7 +320,9 @@ class ElevenLabsStreamPool:
         On completion (or early cancellation) we send ``close_context`` so
         ElevenLabs frees the server-side context; the socket stays warm for others.
         """
-        conn = await self.acquire()  # reserves a context slot (inflight++) under the lock
+        conn = (
+            await self.acquire()
+        )  # reserves a context slot (inflight++) under the lock
         ctx_id = uuid.uuid4().hex
         q: asyncio.Queue = asyncio.Queue()
         conn.contexts[ctx_id] = q
@@ -325,7 +333,12 @@ class ElevenLabsStreamPool:
             if msg.get("voice_settings"):
                 init["voice_settings"] = msg["voice_settings"]
             await conn.send(json.dumps(init))
-            await conn.send(json.dumps({"text": msg.get("text", ""), "context_id": ctx_id}))
+            text_frame = {"text": msg.get("text", ""), "context_id": ctx_id}
+            if msg.get("enable_ssml_parsing"):
+                # SSML parsing applies to the real-text frame (ElevenLabs parses
+                # <break/> tags within this text), not the bare-space init frame.
+                text_frame["enable_ssml_parsing"] = True
+            await conn.send(json.dumps(text_frame))
             await conn.send(json.dumps({"context_id": ctx_id, "flush": True}))
             # ElevenLabs does NOT emit is_final promptly — it parks the context
             # ~20s (or inactivity_timeout) after the last audio chunk waiting for
@@ -355,7 +368,9 @@ class ElevenLabsStreamPool:
             conn.inflight -= 1
             # Free the server-side context (best effort); the socket stays warm.
             try:
-                await conn.send(json.dumps({"context_id": ctx_id, "close_context": True}))
+                await conn.send(
+                    json.dumps({"context_id": ctx_id, "close_context": True})
+                )
             except Exception:
                 pass
 

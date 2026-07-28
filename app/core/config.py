@@ -33,6 +33,11 @@ PROVIDER_DEFAULTS: dict[str, dict] = {
         "model": "eleven_flash_v2_5",
         "speed": 1.15,
         "language": "en",
+        # SSML off by default. Listed here so canonical_params collapses an
+        # explicit False with "absent" into ONE cache key (both = plain-text
+        # synth); only enable_ssml_parsing=True gets its own key. ElevenLabs
+        # only honors this on eleven_flash_v2_5 etc. (NOT eleven_v3).
+        "enable_ssml_parsing": False,
     },
     "gemini": {
         "voice_id": "Kore",
