@@ -195,6 +195,11 @@ class ElevenLabsStreamPool:
         # idle gap is the real end-of-speech signal (mirrors pipecat's
         # stop_frame_timeout).
         idle_timeout: float = 0.8,
+        # SSML parsing is a CONNECT-time setting (per pipecat/ElevenLabs): a
+        # socket parses <break/> tags for ALL utterances multiplexed over it, so
+        # SSML-on and SSML-off need separate warm sockets (the provider keys the
+        # pool by this flag). Appended to the connect URI as a query param.
+        enable_ssml_parsing: bool = False,
     ):
         if not api_key:
             raise ValueError("ElevenLabsStreamPool requires an api_key")
@@ -222,6 +227,10 @@ class ElevenLabsStreamPool:
             f"&output_format={quote(output_format, safe='')}"
             f"&auto_mode=true&inactivity_timeout=120"
         )
+        if enable_ssml_parsing:
+            # Connection-level: the socket parses SSML tags in every utterance
+            # sent over it (matches pipecat's connect-URI query param).
+            self._uri += "&enable_ssml_parsing=true"
         self._headers = {"xi-api-key": api_key}
         self._connect_fn = connect_fn or _default_connect
         self._min_size = min_size
@@ -333,12 +342,9 @@ class ElevenLabsStreamPool:
             if msg.get("voice_settings"):
                 init["voice_settings"] = msg["voice_settings"]
             await conn.send(json.dumps(init))
-            text_frame = {"text": msg.get("text", ""), "context_id": ctx_id}
-            if msg.get("enable_ssml_parsing"):
-                # SSML parsing applies to the real-text frame (ElevenLabs parses
-                # <break/> tags within this text), not the bare-space init frame.
-                text_frame["enable_ssml_parsing"] = True
-            await conn.send(json.dumps(text_frame))
+            await conn.send(
+                json.dumps({"text": msg.get("text", ""), "context_id": ctx_id})
+            )
             await conn.send(json.dumps({"context_id": ctx_id, "flush": True}))
             # ElevenLabs does NOT emit is_final promptly — it parks the context
             # ~20s (or inactivity_timeout) after the last audio chunk waiting for

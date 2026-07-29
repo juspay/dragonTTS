@@ -373,15 +373,38 @@ class CacheService:
         if instance is None:
             raise ProviderNotConfigured(provider)
         gate = get_gate(provider)
+        text = prepend_leading_dot(req.transcript, provider)
         async with gate:
             t0 = time.perf_counter()
-            result = await instance.synth(
-                text=prepend_leading_dot(req.transcript, provider),
-                voice_id=req.voice.id,
-                model=model,
-                language=req.language,
-                params=req.params,
-            )
+            if req.params.get("enable_ssml_parsing"):
+                # SSML: synthesize via the streaming (WS) path, not the one-shot
+                # HTTP synth. ElevenLabs renders <break/> tags more cleanly over
+                # the WS path (the HTTP one-shot can split a word across a break),
+                # so the cached audio is the smoother WS rendering. stream_synth
+                # falls back to HTTP itself if no warm socket is available.
+                chunks = []
+                async for chunk in instance.stream_synth(
+                    text=text,
+                    voice_id=req.voice.id,
+                    model=model,
+                    language=req.language,
+                    params=req.params,
+                ):
+                    chunks.append(chunk)
+                result = AudioResult(
+                    audio=b"".join(chunks),
+                    container="raw",
+                    encoding=instance.native_encoding,
+                    sample_rate=instance.native_sample_rate,
+                )
+            else:
+                result = await instance.synth(
+                    text=text,
+                    voice_id=req.voice.id,
+                    model=model,
+                    language=req.language,
+                    params=req.params,
+                )
         await self._timed("synth", t0, provider)
         return result
 

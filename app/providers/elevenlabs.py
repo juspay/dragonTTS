@@ -80,19 +80,21 @@ class ElevenLabsProvider(BaseTTSProvider):
         return {"stability": 0.5, "similarity_boost": 0.75}
 
     def _get_pool(
-        self, voice_id: str, model_id: str
+        self, voice_id: str, model_id: str, enable_ssml_parsing: bool = False
     ) -> elevenlabs_pool.ElevenLabsStreamPool | None:
-        """Return the warm pool for (voice, model), creating it lazily.
+        """Return the warm pool for (voice, model, ssml), creating it lazily.
 
         Returns ``None`` when pooling is disabled (pool size 0) or the key is
         missing, so the caller falls back to one-shot synth. NB: ``_pools`` grows
-        with distinct (voice, model) pairs and is only cleared at shutdown —
-        acceptable while the voice catalog stays fixed (re-add an LRU cap if it
-        ever diversifies).
+        with distinct (voice, model, ssml) triples and is only cleared at
+        shutdown — acceptable while the voice catalog stays fixed (re-add an LRU
+        cap if it ever diversifies). SSML is part of the key because it's a
+        connect-time socket setting: an SSML-on socket parses <break/> tags for
+        ALL its utterances, so on/off can't share one socket.
         """
         if not self.api_key or settings.elevenlabs_stream_pool_size < 1:
             return None
-        key = (voice_id, model_id)
+        key = (voice_id, model_id, enable_ssml_parsing)
         pool = self._pools.get(key)
         if pool is None:
             pool = elevenlabs_pool.ElevenLabsStreamPool(
@@ -106,6 +108,7 @@ class ElevenLabsProvider(BaseTTSProvider):
                     settings.elevenlabs_stream_pool_size * 2,
                     settings.elevenlabs_stream_pool_size + 4,
                 ),
+                enable_ssml_parsing=enable_ssml_parsing,
             )
             self._pools[key] = pool
         return pool
@@ -239,14 +242,15 @@ class ElevenLabsProvider(BaseTTSProvider):
         final_language = language if language else defaults["language"]
 
         msg = {"text": text, "voice_settings": self._voice_settings(params)}
-        if params.get("enable_ssml_parsing"):
-            msg["enable_ssml_parsing"] = True  # SSML <break/> parsing (see synth)
+        # SSML is a connect-time socket setting (see _get_pool / pool URI), so it
+        # selects which warm pool to use — not a per-message field.
+        ssml = bool(params.get("enable_ssml_parsing"))
         logger.info(
             f"Streaming via ElevenLabs multi-context WS: {text[:50]}... "
-            f"[voice_id={final_voice_id}, model_id={final_model_id}]"
+            f"[voice_id={final_voice_id}, model_id={final_model_id}, ssml={ssml}]"
         )
 
-        pool = self._get_pool(final_voice_id, final_model_id)
+        pool = self._get_pool(final_voice_id, final_model_id, ssml)
         if pool is not None:
             streamed_any = False
             try:
