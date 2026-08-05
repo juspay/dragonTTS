@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -9,7 +11,8 @@ from pydantic import BaseModel
 
 from app.alerts.summary import send_daily_summary
 from app.audio.format import content_type_for
-from app.schemas.cache import CacheEntryInfo, PaginatedCache
+from app.core.logging import logger
+from app.schemas.cache import ByTextResponse, CacheEntryDetail, CacheEntryInfo, PaginatedCache
 
 router = APIRouter()
 
@@ -28,6 +31,31 @@ def _to_info(r) -> CacheEntryInfo:
         size_bytes=r.size_bytes,
         hit_count=r.hit_count,
         created_at=r.created_at,
+    )
+
+
+def _to_detail(r, audio_b64: str | None = None) -> CacheEntryDetail:
+    try:
+        params = json.loads(r.params) if r.params else {}
+    except (ValueError, TypeError):
+        params = {}
+    return CacheEntryDetail(
+        key=r.key,
+        text=r.text,
+        provider=r.provider,
+        voice_id=r.voice_id,
+        model=r.model,
+        language=r.language,
+        params=params,
+        container=r.container,
+        encoding=r.encoding,
+        sample_rate=r.sample_rate,
+        size_bytes=r.size_bytes,
+        hit_count=r.hit_count,
+        created_at=r.created_at,
+        last_accessed_at=r.last_accessed_at,
+        ttl_expires_at=r.ttl_expires_at,
+        audio_base64=audio_b64,
     )
 
 
@@ -240,6 +268,104 @@ async def slack_summary(request: Request):
     cache = request.app.state.cache
     sent = await send_daily_summary(cache, force=True)
     return {"sent": sent}
+
+
+@router.get("/cache/by-text", response_model=ByTextResponse)
+async def cache_by_text(
+    request: Request,
+    text: str = Query(..., description="text to look up"),
+    match: str = Query("exact", description="'exact' (default) or 'substring'"),
+    provider: str | None = None,
+    voice_id: str | None = None,
+    include_audio: bool = Query(False, description="base64-encode each clip's audio"),
+    limit: int = Query(100, ge=1, le=MAX_CACHE_LIST_LIMIT),
+):
+    """Look up every cached entry for a text (all provider/model/voice/param
+    variants). Returns full metadata + parsed params + hash; optionally inline
+    audio (base64) when include_audio=true."""
+    metadata = request.app.state.metadata
+    blobs = request.app.state.blobs
+    records = await metadata.list(
+        provider=provider,
+        voice_id=voice_id,
+        limit=limit,
+        offset=0,
+        q=text,
+        match=match,
+    )
+    entries = []
+    for r in records:
+        audio_b64 = None
+        if include_audio:
+            try:
+                audio_b64 = base64.b64encode(
+                    await blobs.get(r.storage_path)
+                ).decode("ascii")
+            except Exception as e:  # missing blob — skip audio, keep metadata
+                logger.warning(f"blob read failed for {r.key}: {e}")
+        entries.append(_to_detail(r, audio_b64))
+    return ByTextResponse(entries=entries, count=len(entries))
+
+
+@router.post("/cache/{key}/resynth")
+async def resynth_cache(key: str, request: Request):
+    """Re-synthesize an entry from its stored metadata (same key, fresh audio)."""
+    cache = request.app.state.cache
+    try:
+        key, status, source, size, provider, model, enc, rate = (
+            await cache.resynth_by_key(key)
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="cache key not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "key": key,
+        "status": status,
+        "source": source,
+        "size_bytes": size,
+        "provider": provider,
+        "model": model,
+        "encoding": enc,
+        "sample_rate": rate,
+    }
+
+
+class ReplaceAudioRequest(BaseModel):
+    """Body for POST /cache/{key}/audio — a user-supplied WAV recording as
+    base64. Mirrors the ``audio_base64`` convention of /tts/create (no multipart
+    dependency)."""
+
+    audio_base64: str
+
+
+@router.post("/cache/{key}/audio")
+async def replace_cache_audio(key: str, body: ReplaceAudioRequest, request: Request):
+    """Replace an entry's audio blob with a user-supplied WAV recording (base64).
+    The upload is decoded + converted to the entry's native format."""
+    cache = request.app.state.cache
+    try:
+        data = base64.b64decode(body.audio_base64)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid audio_base64: {e}")
+    try:
+        key, status, source, size, provider, model, enc, rate = (
+            await cache.replace_audio_by_key(key, data)
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="cache key not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "key": key,
+        "status": status,
+        "source": source,
+        "size_bytes": size,
+        "provider": provider,
+        "model": model,
+        "encoding": enc,
+        "sample_rate": rate,
+    }
 
 
 @router.get("/cache/{key}")
