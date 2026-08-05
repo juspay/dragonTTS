@@ -54,13 +54,20 @@ async def tts_bytes(req: TTSRequest, request: Request):
     except ProviderNotConfigured as e:
         raise HTTPException(status_code=503, detail=str(e))
     except ProviderBusy as e:
-        raise HTTPException(status_code=503, detail=str(e), headers={"Retry-After": "1"})
+        raise HTTPException(
+            status_code=503, detail=str(e), headers={"Retry-After": "1"}
+        )
     except ProviderError as e:
         raise HTTPException(
             status_code=502, detail=f"upstream {provider} returned an error: {e}"
         )
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         raise _map_upstream_error(provider, e)
+    except Exception as e:  # any other provider/lib error -> 502 with the reason
+        raise HTTPException(
+            status_code=502,
+            detail=f"upstream {provider} error: {type(e).__name__}: {e}",
+        )
 
     return Response(
         content=audio,
@@ -92,10 +99,17 @@ async def tts_stream(req: TTSRequest, request: Request):
     except ProviderNotConfigured as e:
         raise HTTPException(status_code=503, detail=str(e))
     except ProviderBusy as e:
-        raise HTTPException(status_code=503, detail=str(e), headers={"Retry-After": "1"})
+        raise HTTPException(
+            status_code=503, detail=str(e), headers={"Retry-After": "1"}
+        )
     except ProviderError as e:
         raise HTTPException(
             status_code=502, detail=f"upstream {provider} returned an error: {e}"
+        )
+    except Exception as e:  # any other provider/lib error -> 502 with the reason
+        raise HTTPException(
+            status_code=502,
+            detail=f"upstream {provider} error: {type(e).__name__}: {e}",
         )
 
     try:
@@ -104,10 +118,18 @@ async def tts_stream(req: TTSRequest, request: Request):
         first = b""
     except ProviderBusy as e:
         await gen.aclose()
-        raise HTTPException(status_code=503, detail=str(e), headers={"Retry-After": "1"})
+        raise HTTPException(
+            status_code=503, detail=str(e), headers={"Retry-After": "1"}
+        )
     except (ProviderError, httpx.HTTPStatusError, httpx.RequestError, OSError) as e:
         await gen.aclose()
         raise _map_upstream_error(provider, e)
+    except Exception as e:  # any other provider/lib error -> 502 with the reason
+        await gen.aclose()
+        raise HTTPException(
+            status_code=502,
+            detail=f"upstream {provider} error: {type(e).__name__}: {e}",
+        )
 
     async def body(first_chunk: bytes) -> AsyncGenerator[bytes, None]:
         try:
@@ -165,17 +187,26 @@ async def tts_create(req: TTSRequest, request: Request):
             raise HTTPException(status_code=400, detail="invalid audio_base64")
 
     try:
-        key, status, source, size, _, model, enc, rate = await cache.create(req, audio_override)
+        key, status, source, size, _, model, enc, rate = await cache.create(
+            req, audio_override
+        )
     except ProviderNotConfigured as e:
         raise HTTPException(status_code=503, detail=str(e))
     except ProviderBusy as e:
-        raise HTTPException(status_code=503, detail=str(e), headers={"Retry-After": "1"})
+        raise HTTPException(
+            status_code=503, detail=str(e), headers={"Retry-After": "1"}
+        )
     except ProviderError as e:
         raise HTTPException(
             status_code=502, detail=f"upstream {provider} returned an error: {e}"
         )
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         raise _map_upstream_error(provider, e)
+    except Exception as e:  # any other provider/lib error -> 502 with the reason
+        raise HTTPException(
+            status_code=502,
+            detail=f"upstream {provider} error: {type(e).__name__}: {e}",
+        )
 
     return CreateResponse(
         key=key,
@@ -222,7 +253,9 @@ async def tts_create_bulk(requests: list[TTSRequest], request: Request):
             audio_override = None
             if req.audio_base64:
                 audio_override = base64.b64decode(req.audio_base64)
-            key, status, source, size, provider, model, _enc, _rate = await cache.create(req, audio_override)
+            key, status, source, size, provider, model, _enc, _rate = (
+                await cache.create(req, audio_override)
+            )
             results.append(
                 {
                     "index": i,

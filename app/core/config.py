@@ -197,6 +197,14 @@ class Settings(BaseSettings):
     # latency_samples rows older than this are pruned by the periodic checkpoint
     # loop, keeping the table bounded.
     metrics_latency_retention_days: int = 14
+    # Max width (days) of any analytics date range (/stats, /stats/daily,
+    # /stats/latency). Bounds the aggregation so a wide "last year" range can't
+    # CPU-bomb the single pod; unset from/to defaults to the last N days (not
+    # all-time, which would full-scan metrics_daily/latency_samples). Raise for
+    # longer cache-hit trend windows — metrics_daily is 1 row/day, so even 90
+    # days is cheap; the real cost is latency_samples p95 sorts, hence the tight
+    # default matching its 14-day retention.
+    analytics_max_range_days: int = 10
     # --- Predictive cache warming (Part 1: frequency-based auto-warm) ---
     # Tracks recurring phrase substrings across requests and warms the frequent
     # ones into the cache so Part 2 (segment + stitch) can assemble them.

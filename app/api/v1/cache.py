@@ -4,17 +4,67 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.alerts.summary import send_daily_summary
 from app.audio.format import content_type_for
+from app.core.config import settings
 from app.core.logging import logger
-from app.schemas.cache import ByTextResponse, CacheEntryDetail, CacheEntryInfo, PaginatedCache
+from app.schemas.cache import (
+    ByTextResponse,
+    CacheEntryDetail,
+    CacheEntryInfo,
+    PaginatedCache,
+)
 
 router = APIRouter()
+
+# Bound analytics date ranges so a wide query can't CPU-bomb the single pod.
+# None/None -> last N days (NOT all-time, which would full-scan the tables).
+ANALYTICS_MAX_RANGE_DAYS = settings.analytics_max_range_days
+# Cap entries returned WITH inline audio (each carries a base64 blob), so
+# include_audio=true can't build a multi-hundred-MB JSON response.
+BY_TEXT_AUDIO_LIMIT = 25
+# Cap a user-supplied audio upload (base64 of a WAV recording).
+MAX_AUDIO_UPLOAD_B64_BYTES = 12_000_000  # ~9 MB decoded WAV
+
+
+def _bound_range(from_date: str | None, to_date: str | None) -> tuple[str, str]:
+    """Parse + bound an analytics date range to <= ANALYTICS_MAX_RANGE_DAYS.
+
+    Returns (from_iso, to_iso). Unset bounds default to the last N days (not
+    all-time, which would full-scan the tables). Raises HTTPException(400) on
+    bad format, inverted range, or a range wider than the cap.
+    """
+    today = datetime.now(timezone.utc).date()
+
+    def _parse(s: str | None):
+        if s is None:
+            return None
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail=f"invalid date {s!r}; use YYYY-MM-DD"
+            )
+
+    f = _parse(from_date)
+    t = _parse(to_date)
+    n = ANALYTICS_MAX_RANGE_DAYS
+    if f is None and t is None:
+        f, t = today - timedelta(days=n - 1), today
+    elif f is None:
+        f = t - timedelta(days=n - 1)
+    elif t is None:
+        t = min(f + timedelta(days=n - 1), today)
+    if t < f:
+        raise HTTPException(status_code=400, detail="'to' must be on/after 'from'")
+    if (t - f).days + 1 > n:
+        raise HTTPException(status_code=400, detail=f"date range exceeds {n} days")
+    return f.isoformat(), t.isoformat()
 
 
 def _to_info(r) -> CacheEntryInfo:
@@ -71,8 +121,12 @@ async def list_cache(
     offset: int = 0,
     q: str | None = Query(default=None, description="filter by text (see match)"),
     match: str = Query(default="exact", description="'exact' (default) or 'substring'"),
-    created_after: str | None = Query(default=None, description="YYYY-MM-DD, inclusive"),
-    created_before: str | None = Query(default=None, description="YYYY-MM-DD, exclusive"),
+    created_after: str | None = Query(
+        default=None, description="YYYY-MM-DD, inclusive"
+    ),
+    created_before: str | None = Query(
+        default=None, description="YYYY-MM-DD, exclusive"
+    ),
 ):
     """Paginated entry listing with optional text/date filters. limit is clamped
     to [1, MAX_CACHE_LIST_LIMIT]. q+match filters text; created_after is
@@ -82,12 +136,20 @@ async def list_cache(
     offset = max(0, offset)
     # Fetch one extra row to detect a next page without a COUNT(*) scan.
     records = await metadata.list(
-        provider=provider, voice_id=voice_id, limit=limit + 1, offset=offset,
-        q=q, match=match, created_before=created_before, created_after=created_after,
+        provider=provider,
+        voice_id=voice_id,
+        limit=limit + 1,
+        offset=offset,
+        q=q,
+        match=match,
+        created_before=created_before,
+        created_after=created_after,
     )
     has_next = len(records) > limit
     entries = [_to_info(r) for r in records[:limit]]
-    return PaginatedCache(entries=entries, offset=offset, limit=limit, has_next=has_next)
+    return PaginatedCache(
+        entries=entries, offset=offset, limit=limit, has_next=has_next
+    )
 
 
 @router.get("/stats")
@@ -99,19 +161,14 @@ async def stats(
     """Cache metrics. Request metrics are date-filterable (?from=&to= YYYY-MM-DD);
     the cache snapshot is the current point-in-time state. All from stored
     rollups/totals — no full-table scan per call."""
-    for label, value in (("from", from_date), ("to", to_date)):
-        if value is not None:
-            try:
-                datetime.strptime(value, "%Y-%m-%d")
-            except ValueError:
-                raise HTTPException(
-                    status_code=400, detail=f"invalid {label}; use YYYY-MM-DD"
-                )
+    from_date, to_date = _bound_range(from_date, to_date)
     metadata = request.app.state.metadata
     registry = request.app.state.registry
     metrics = await metadata.metrics_summary(from_date=from_date, to_date=to_date)
     snapshot = await metadata.stats()
-    providers = await metadata.provider_metrics_summary(from_date=from_date, to_date=to_date)
+    providers = await metadata.provider_metrics_summary(
+        from_date=from_date, to_date=to_date
+    )
     latency = await metadata.latency_summary(from_date=from_date, to_date=to_date)
     return {
         "range": {"from": from_date, "to": to_date},
@@ -138,14 +195,11 @@ async def stats_daily(
     words_from_cache_pct, stitch_coverage_avg derived) plus a per-provider
     breakdown. ``provider`` narrows the view to one provider (its totals then
     reflect that provider only). ?from=&to= YYYY-MM-DD (UTC dates)."""
-    for label, value in (("from", from_date), ("to", to_date)):
-        if value is not None:
-            try:
-                datetime.strptime(value, "%Y-%m-%d")
-            except ValueError:
-                raise HTTPException(status_code=400, detail=f"invalid {label}; use YYYY-MM-DD")
+    from_date, to_date = _bound_range(from_date, to_date)
     cache = request.app.state.cache
-    return await cache.daily_stats(from_date=from_date, to_date=to_date, provider=provider)
+    return await cache.daily_stats(
+        from_date=from_date, to_date=to_date, provider=provider
+    )
 
 
 @router.get("/stats/latency")
@@ -160,12 +214,7 @@ async def stats_latency(
     ``cache_serve`` (HIT serve), ``ttfb`` (stream first byte), plus a derived
     ``miss_overhead_us`` = total.avg - synth.avg (DragonTTS work beyond the
     provider call). ?from=&to= YYYY-MM-DD (UTC); ?provider= narrows to one."""
-    for label, value in (("from", from_date), ("to", to_date)):
-        if value is not None:
-            try:
-                datetime.strptime(value, "%Y-%m-%d")
-            except ValueError:
-                raise HTTPException(status_code=400, detail=f"invalid {label}; use YYYY-MM-DD")
+    from_date, to_date = _bound_range(from_date, to_date)
     metadata = request.app.state.metadata
     providers = await metadata.latency_summary_by_provider(
         from_date=from_date, to_date=to_date, provider=provider
@@ -230,8 +279,11 @@ async def delete_by_text(body: DeleteByTextBody, request: Request):
     cache = request.app.state.cache
     try:
         return await cache.delete_by_text(
-            text=body.text, provider=body.provider, voice_id=body.voice_id,
-            match=body.match, dry_run=body.dry_run,
+            text=body.text,
+            provider=body.provider,
+            voice_id=body.voice_id,
+            match=body.match,
+            dry_run=body.dry_run,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -285,6 +337,8 @@ async def cache_by_text(
     audio (base64) when include_audio=true."""
     metadata = request.app.state.metadata
     blobs = request.app.state.blobs
+    if include_audio:
+        limit = min(limit, BY_TEXT_AUDIO_LIMIT)
     records = await metadata.list(
         provider=provider,
         voice_id=voice_id,
@@ -298,9 +352,9 @@ async def cache_by_text(
         audio_b64 = None
         if include_audio:
             try:
-                audio_b64 = base64.b64encode(
-                    await blobs.get(r.storage_path)
-                ).decode("ascii")
+                audio_b64 = base64.b64encode(await blobs.get(r.storage_path)).decode(
+                    "ascii"
+                )
             except Exception as e:  # missing blob — skip audio, keep metadata
                 logger.warning(f"blob read failed for {r.key}: {e}")
         entries.append(_to_detail(r, audio_b64))
@@ -319,6 +373,10 @@ async def resynth_cache(key: str, request: Request):
         raise HTTPException(status_code=404, detail="cache key not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except (
+        Exception
+    ) as e:  # provider synth/upload failure (ProviderError/httpx) -> 502, not 500
+        raise HTTPException(status_code=502, detail=f"upstream failure: {e}")
     return {
         "key": key,
         "status": status,
@@ -336,7 +394,11 @@ class ReplaceAudioRequest(BaseModel):
     base64. Mirrors the ``audio_base64`` convention of /tts/create (no multipart
     dependency)."""
 
-    audio_base64: str
+    audio_base64: str = Field(
+        ...,
+        max_length=MAX_AUDIO_UPLOAD_B64_BYTES,
+        description="WAV recording, base64-encoded (<=~9MB)",
+    )
 
 
 @router.post("/cache/{key}/audio")
@@ -356,6 +418,10 @@ async def replace_cache_audio(key: str, body: ReplaceAudioRequest, request: Requ
         raise HTTPException(status_code=404, detail="cache key not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except (
+        Exception
+    ) as e:  # provider synth/upload failure (ProviderError/httpx) -> 502, not 500
+        raise HTTPException(status_code=502, detail=f"upstream failure: {e}")
     return {
         "key": key,
         "status": status,
