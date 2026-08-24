@@ -189,6 +189,12 @@ class GeminiProvider(BaseTTSProvider):
             async for response in responses:
                 if response.audio_content:
                     chunks.append(response.audio_content)
+        except Exception as e:
+            raise ProviderError(
+                f"gemini synth error: {e} [model={final_model}, "
+                f"voice={final_voice_id}, lang={final_language}, "
+                f"text={text[:80]!r}]"
+            ) from e
         finally:
             # Cancel the gRPC stream on early abandon (see stream_synth).
             _cancel = getattr(responses, "cancel", None)
@@ -268,7 +274,13 @@ class GeminiProvider(BaseTTSProvider):
             if tail:
                 yield tail
         except Exception as e:
-            raise ProviderError(f"gemini stream error: {e}") from e
+            # Include the request shape so a 400 "invalid argument" is
+            # diagnosable from the message alone (which text/voice/model).
+            raise ProviderError(
+                f"gemini stream error: {e} [model={final_model}, "
+                f"voice={final_voice_id}, lang={final_language}, "
+                f"text={text[:80]!r}]"
+            ) from e
         finally:
             # Cancel the server-side gRPC stream if the consumer abandoned early
             # (a /tts/stream disconnect throws GeneratorExit, which the except

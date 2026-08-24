@@ -30,6 +30,18 @@ ANALYTICS_MAX_RANGE_DAYS = settings.analytics_max_range_days
 BY_TEXT_AUDIO_LIMIT = 25
 # Cap a user-supplied audio upload (base64 of a WAV recording).
 MAX_AUDIO_UPLOAD_B64_BYTES = 12_000_000  # ~9 MB decoded WAV
+# Supported text-match modes. Anything else used to silently fall through to
+# exact matching; reject it so a typo surfaces as 400 instead of wrong results.
+ALLOWED_MATCH = ("exact", "substring")
+
+
+def _validate_match(match: str) -> str:
+    """Reject unknown match modes (only exact/substring are supported)."""
+    if match not in ALLOWED_MATCH:
+        raise HTTPException(
+            status_code=400, detail=f"match must be one of {ALLOWED_MATCH}"
+        )
+    return match
 
 
 def _bound_range(from_date: str | None, to_date: str | None) -> tuple[str, str]:
@@ -131,6 +143,7 @@ async def list_cache(
     """Paginated entry listing with optional text/date filters. limit is clamped
     to [1, MAX_CACHE_LIST_LIMIT]. q+match filters text; created_after is
     inclusive, created_before is exclusive (both YYYY-MM-DD)."""
+    _validate_match(match)
     metadata = request.app.state.metadata
     limit = max(1, min(limit, MAX_CACHE_LIST_LIMIT))
     offset = max(0, offset)
@@ -276,6 +289,7 @@ async def delete_by_text(body: DeleteByTextBody, request: Request):
     provider/voice_id. ``dry_run`` defaults True — previews matched entries +
     keys without deleting; set ``dry_run: false`` to delete. Requires at least
     one filter (text/provider/voice_id) — use /cache/clear to wipe everything."""
+    _validate_match(body.match)
     cache = request.app.state.cache
     try:
         return await cache.delete_by_text(
@@ -335,6 +349,7 @@ async def cache_by_text(
     """Look up every cached entry for a text (all provider/model/voice/param
     variants). Returns full metadata + parsed params + hash; optionally inline
     audio (base64) when include_audio=true."""
+    _validate_match(match)
     metadata = request.app.state.metadata
     blobs = request.app.state.blobs
     if include_audio:
@@ -441,7 +456,15 @@ async def get_cache(key: str, request: Request):
     record = await metadata.get(key)
     if not record:
         raise HTTPException(status_code=404, detail="cache key not found")
-    audio = await blobs.get(record.storage_path)
+    try:
+        audio = await blobs.get(record.storage_path)
+    except FileNotFoundError:
+        # Poisoned row (purge-vs-restore race) — 404, not a raw 500. A read
+        # through /tts/bytes or /tts/stream self-heals it (re-synth + re-store).
+        raise HTTPException(
+            status_code=404,
+            detail="cache key found but its blob file is missing (will self-heal on next TTS read)",
+        )
     return Response(
         content=audio,
         media_type=content_type_for(record.encoding),

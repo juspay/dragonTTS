@@ -6,7 +6,7 @@ reused across both services.
 
 from __future__ import annotations
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Per-provider defaults. Ported from clairvoyance BB_SPEECH_PROVIDER_DEFAULTS.
@@ -181,7 +181,15 @@ class Settings(BaseSettings):
     provider_max_concurrent_synths: int = 24
     provider_rate_limit_per_sec: float = 0.0
     provider_bulkhead_wait_timeout_ms: int = 2500
-    provider_resilience_overrides: dict = Field(default_factory=dict)
+    provider_resilience_overrides: dict = Field(
+        default_factory=dict,
+        # The documented + deployed env name is PROVIDER_RESILIENCE (see the
+        # comment above and deploy/k8s/deployment.yaml) — without this alias
+        # pydantic only matches PROVIDER_RESILIENCE_OVERRIDES and the
+        # deployment's value is SILENTLY ignored (extra="ignore"), leaving the
+        # bulkhead at the global defaults. Accept both names.
+        validation_alias=AliasChoices("PROVIDER_RESILIENCE", "PROVIDER_RESILIENCE_OVERRIDES"),
+    )
     # --- Write-behind metrics (off the hot HIT path) ---
     # HIT touch/metric updates are batched + flushed by a background task so a HIT
     # returns audio without awaiting a SQLite write. Flush by interval or batch

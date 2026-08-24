@@ -71,11 +71,15 @@ class ElevenLabsProvider(BaseTTSProvider):
             else settings.elevenlabs_indian_residency_base_url
         )
         self._client = httpx.AsyncClient(timeout=30.0)
-        # One warm pool per (voice_id, model_id): the WS binds voice (URL path)
-        # and model_id (connect-time query param) for the socket's lifetime, so
-        # differing voice/model need separate sockets. Lazily created on first
-        # streaming miss; warmed eagerly when the model matches a default.
-        self._pools: dict[tuple[str, str], elevenlabs_pool.ElevenLabsStreamPool] = {}
+        # One warm pool per (voice_id, model_id, enable_ssml_parsing, language):
+        # the WS binds voice (URL path) and model_id (connect-time query param)
+        # for the socket's lifetime, and SSML + language are connect-time socket
+        # settings (see _get_pool), so differing values need separate sockets.
+        # Lazily created on first streaming miss; warmed eagerly when the model
+        # matches a default.
+        self._pools: dict[
+            tuple[str, str, bool, str | None], elevenlabs_pool.ElevenLabsStreamPool
+        ] = {}
 
     def _voice_settings(self, params: dict) -> dict:
         # Caller-supplied voice_settings win; otherwise mirror the one-shot
@@ -113,6 +117,12 @@ class ElevenLabsProvider(BaseTTSProvider):
         """
         if not self.api_key or settings.elevenlabs_stream_pool_size < 1:
             return None
+        # Non-multilingual models ignore language on the socket (the pool only
+        # sends language_code for multilingual models), so normalize it out of
+        # the key — otherwise identical requests that differ only by language
+        # each spin up a redundant warm socket (pool fragmentation).
+        if model_id not in _ELEVENLABS_MULTILINGUAL_MODELS:
+            language = None
         key = (voice_id, model_id, enable_ssml_parsing, language)
         pool = self._pools.get(key)
         if pool is None:

@@ -11,4 +11,7 @@ spec:
   storageClassName: premium-rwo
   resources:
     requests:
-      storage: 30Gi
+      # 2026-08-22: 100Gi -> 250Gi (prod had been manually expanded to 100Gi
+      # while this manifest still said 30Gi — keep it in sync from now on).
+      # Expansion is online with the PD CSI driver; no pod restart needed.
+      storage: 250Gi
