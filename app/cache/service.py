@@ -30,12 +30,7 @@ from app.audio.format import convert_audio
 from app.audio.text import normalize_for_tts, prepend_leading_dot
 from app.cache.metrics import WriteBehindMetrics
 from app.cache.resilience import get_gate
-from app.cache.key import (
-    canonical_params,
-    hash_key,
-    normalize_text,
-    parse_model_id,
-)
+from app.cache.key import canonical_params, hash_key, normalize_text, parse_model_id
 from app.cache.segment import MAX_SPAN, segment_dp
 from app.core.config import settings
 from app.core.logging import logger
@@ -1947,7 +1942,17 @@ class CacheService:
         pointing at a missing file. Returns the number of entries purged."""
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
         rows = await self._metadata.purge_expired(now_iso)
-        for _prov, _size, path in rows:
+        # Purge-vs-restore race guard: a concurrent MISS for one of these keys
+        # can re-write the blob and re-insert the row between the purge txn
+        # and this unlink — unlinking then deletes the FRESH blob and leaves
+        # a poisoned row (row without file). Snapshot live keys AFTER the
+        # txn: a key that is live again was re-created, so keep its file.
+        # (Residual window — a re-store landing after the snapshot — is
+        # covered by the read-time self-heal.)
+        live = await self._metadata.all_keys() if rows else set()
+        for _prov, _size, path, key in rows:
+            if key in live:
+                continue
             try:
                 await self._blobs.delete(path)
             except Exception as e:

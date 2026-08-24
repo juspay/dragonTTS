@@ -24,30 +24,15 @@ spec:
         image: asia-south1-docker.pkg.dev/breeze-automatic-prod/dragontts/dragontts:latest
         imagePullPolicy: Always
         env:
+        # Values (pools, bulkhead caps, TTL, purge schedule, bulk cap, split,
+        # thread pool) all live in app/core/config.py DEFAULTS now — no value
+        # env needed. Only paths + credentials + business endpoints stay here.
         - name: DB_PATH
           value: /app/data/dragontts.db
         - name: BLOB_DIR
           value: /app/data/blobs
-        - name: MAX_CACHE_BYTES
-          value: '0'
-        - name: ENABLE_WRITE_THROUGH
-          value: 'true'
-        - name: CARTESIA_STREAM_POOL_SIZE
-          value: '5'
-        - name: SARVAM_STREAM_POOL_SIZE
-          value: '5'
-        - name: ELEVENLABS_STREAM_POOL_SIZE
-          value: '16'
         - name: GOOGLE_CREDENTIALS_JSON
           value: ''
-        - name: PROVIDER_RESILIENCE
-          value: '{"cartesia":{"max_concurrent":10,"wait_timeout_ms":3000},"sarvam":{"max_concurrent":10,"wait_timeout_ms":3000},"elevenlabs":{"max_concurrent":30,"wait_timeout_ms":3000},"gemini":{"max_concurrent":30,"wait_timeout_ms":3000}}'
-        - name: CARTESIA_WS_FORCE_IPV4
-          value: 'true'
-        - name: THREAD_POOL_WORKERS
-          value: '32'
-        - name: BULK_CREATE_MAX
-          value: '100'
         - name: CARTESIA_API_KEY
           value: ''
         - name: SARVAM_API_KEY
@@ -60,8 +45,6 @@ spec:
           value: '16:30'
         - name: SLACK_COST_PER_WORD
           value: '{"cartesia":0.000002,"elevenlabs":0.00032,"gemini":0.00016,"sarvam":0.000005}'
-        - name: SPLIT_AT_SYMBOLS
-          value: ''
         # --- Graceful drain / clairvoyance kill switch (empty => kill-switch POST is a no-op;
         # inject CLAIRVOYANCE_URL + a clairvoyance admin JWT via kubectl set env) ---
         - name: CLAIRVOYANCE_URL

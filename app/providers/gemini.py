@@ -29,10 +29,23 @@ from google.oauth2 import service_account
 from app.audio.resample import StreamingResampler
 from app.core.config import PROVIDER_DEFAULTS, settings
 from app.core.logging import logger
-from app.providers.base import AudioResult, BaseTTSProvider, ProviderError
+from app.providers.base import AudioResult, BaseTTSProvider, ProviderError, ProviderRateLimited
 
 # Gemini TTS native sample rate — fixed by the API.
 _GEMINI_SAMPLE_RATE = 24_000
+
+
+def _is_quota_rejection(e: Exception) -> bool:
+    """True when the gRPC/HTTP error is a rate limit / quota rejection.
+
+    Structural checks only: google.api_core's ResourceExhausted (matched by
+    class name so the module needn't be imported) or a grpc status code whose
+    name is RESOURCE_EXHAUSTED.
+    """
+    if type(e).__name__ == "ResourceExhausted":
+        return True
+    code = getattr(e, "code", None)
+    return getattr(code, "name", "") == "RESOURCE_EXHAUSTED"
 
 
 class GeminiProvider(BaseTTSProvider):
@@ -190,11 +203,16 @@ class GeminiProvider(BaseTTSProvider):
                 if response.audio_content:
                     chunks.append(response.audio_content)
         except Exception as e:
-            raise ProviderError(
-                f"gemini synth error: {e} [model={final_model}, "
-                f"voice={final_voice_id}, lang={final_language}, "
-                f"text={text[:80]!r}]"
-            ) from e
+            # Neither the log NOR the exception carries the transcript (caller
+            # content / PII) — shape only: model/voice/lang/word-count/length.
+            ctx = (
+                f"[model={final_model}, voice={final_voice_id}, "
+                f"lang={final_language}, words={len(text.split())}]"
+            )
+            logger.error(f"gemini synth error: {e} {ctx} text_len={len(text)}")
+            if _is_quota_rejection(e):
+                raise ProviderRateLimited(f"gemini rate-limited: {e} {ctx}") from e
+            raise ProviderError(f"gemini synth error: {e} {ctx}") from e
         finally:
             # Cancel the gRPC stream on early abandon (see stream_synth).
             _cancel = getattr(responses, "cancel", None)
@@ -274,13 +292,16 @@ class GeminiProvider(BaseTTSProvider):
             if tail:
                 yield tail
         except Exception as e:
-            # Include the request shape so a 400 "invalid argument" is
-            # diagnosable from the message alone (which text/voice/model).
-            raise ProviderError(
-                f"gemini stream error: {e} [model={final_model}, "
-                f"voice={final_voice_id}, lang={final_language}, "
-                f"text={text[:80]!r}]"
-            ) from e
+            # Neither the log NOR the exception carries the transcript (caller
+            # content / PII) — shape only: model/voice/lang/word-count/length.
+            ctx = (
+                f"[model={final_model}, voice={final_voice_id}, "
+                f"lang={final_language}, words={len(text.split())}]"
+            )
+            logger.error(f"gemini stream error: {e} {ctx} text_len={len(text)}")
+            if _is_quota_rejection(e):
+                raise ProviderRateLimited(f"gemini rate-limited: {e} {ctx}") from e
+            raise ProviderError(f"gemini stream error: {e} {ctx}") from e
         finally:
             # Cancel the server-side gRPC stream if the consumer abandoned early
             # (a /tts/stream disconnect throws GeneratorExit, which the except
